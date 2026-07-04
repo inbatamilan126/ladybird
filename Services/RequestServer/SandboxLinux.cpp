@@ -24,6 +24,7 @@ ErrorOr<void> apply_sandbox(Vector<ByteString> const& certificates)
     TRY(Core::Directory::create(cache_path.to_byte_string(), Core::Directory::CreateDirectories::Yes));
 
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/etc/ssl"sv, Sandbox::LandlockPath::Access::ReadOnly));
+    TRY(Sandbox::add_landlock_path_if_exists(paths, "/etc/ca-certificates"sv, Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/etc/host.conf"sv, Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/etc/hosts"sv, Sandbox::LandlockPath::Access::ReadOnly));
     TRY(Sandbox::add_landlock_path_if_exists(paths, "/etc/nsswitch.conf"sv, Sandbox::LandlockPath::Access::ReadOnly));

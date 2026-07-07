@@ -328,6 +328,7 @@ set(SOURCES
     CSS/Time.cpp
     CSS/TransitionEvent.cpp
     CSS/URL.cpp
+    CSS/UpdateStyle.cpp
     CSS/ValueType.cpp
     CSS/VisualViewport.cpp
     DOM/AbortController.cpp
@@ -377,6 +378,7 @@ set(SOURCES
     DOM/PseudoElement.cpp
     DOM/QualifiedName.cpp
     DOM/Range.cpp
+    DOM/SelectorQuery.cpp
     DOM/ShadowRoot.cpp
     DOM/Slot.cpp
     DOM/SlotRegistry.cpp
@@ -891,7 +893,6 @@ set(SOURCES
     Painting/MarkerPaintable.cpp
     Painting/NavigableContainerViewportPaintable.cpp
     Painting/Paintable.cpp
-    Painting/PaintableBox.cpp
     Painting/PaintStyle.cpp
     Painting/PaintableFragment.cpp
     Painting/PaintableWithLines.cpp

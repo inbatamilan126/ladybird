@@ -60,7 +60,7 @@
 #include <LibWeb/MimeSniff/Resource.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/PaintableBox.h>
+#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/UIEvents/EventNames.h>
 #include <LibWeb/UIEvents/InputEvent.h>
@@ -194,8 +194,8 @@ void HTMLInputElement::adjust_computed_style(CSS::ComputedProperties::Builder& s
 
     // NOTE: Other browsers apply a minimum height of a single line's line-height to single-line input elements.
     if (is_single_line() && style.property(CSS::PropertyID::Height).has_auto()) {
-        auto current_line_height = style.line_height().to_double();
-        auto minimum_line_height = style.first_available_computed_font(document().font_computer())->pixel_size() * CSS::ComputedProperties::normal_line_height_scale;
+        auto current_line_height = style.line_height(document().font_computer()).to_double();
+        auto minimum_line_height = CSS::ComputedProperties::normal_line_height(style.first_available_computed_font(document().font_computer())->pixel_metrics()).to_double();
 
         // FIXME: Instead of overriding line-height, we should set height here instead.
         if (current_line_height < minimum_line_height)
@@ -216,17 +216,18 @@ void HTMLInputElement::set_checked(bool checked)
     CSS::Invalidation::invalidate_style_after_checked_state_change(*this, DOM::StyleInvalidationReason::HTMLInputElementSetChecked);
 
     set_needs_repaint();
-}
 
-void HTMLInputElement::set_checked_binding(bool checked)
-{
-    if (type_state() == TypeAttributeState::RadioButton) {
-        if (checked)
-            set_checked_within_group();
-        else
-            set_checked(false);
-    } else {
-        set_checked(checked);
+    // https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio)
+    if (type_state() == TypeAttributeState::RadioButton && checked) {
+        // No point iterating the tree if we have an empty name.
+        if (!name().has_value() || name()->is_empty())
+            return;
+
+        root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
+            if (element.checked() && &element != this && is_in_same_radio_button_group_as(element))
+                element.set_checked(false);
+            return TraversalDecision::Continue;
+        });
     }
 }
 
@@ -847,38 +848,6 @@ void HTMLInputElement::commit_pending_changes()
     dispatch_event(change_event);
 }
 
-// https://www.w3.org/TR/css-ui-4/#input-rules
-static GC::Ref<CSS::CSSStyleProperties> inner_text_style_when_visible()
-{
-    static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
-    if (!style) {
-        style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
-        style->set_declarations_from_text(R"~~~(
-                width: 100%;
-                height: 1lh;
-                align-items: center;
-                overflow: auto;
-                scrollbar-width: none;
-                text-overflow: clip;
-                white-space: nowrap;
-            )~~~"sv);
-    }
-    return *style;
-}
-
-static GC::Ref<CSS::CSSStyleProperties> inner_text_style_when_hidden()
-{
-    static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
-    if (!style) {
-        style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
-        style->set_declarations_from_text(R"~~~(
-                width: 0;
-                display: inline;
-            )~~~"sv);
-    }
-    return *style;
-}
-
 static GC::Ref<CSS::CSSStyleProperties> stepper_button_style_when_visible()
 {
     static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
@@ -912,11 +881,12 @@ static GC::Ref<CSS::CSSStyleProperties> placeholder_style_when_visible()
         style->set_declarations_from_text(R"~~~(
                 width: 100%;
                 height: 1lh;
-                align-items: center;
                 overflow: hidden;
-                scrollbar-width: none;
                 text-overflow: clip;
                 white-space: nowrap;
+                margin-inline-start: -100%;
+                pointer-events: none;
+                user-select: none;
             )~~~"sv);
     }
     return *style;
@@ -936,13 +906,10 @@ void HTMLInputElement::update_placeholder_visibility()
 {
     if (!m_placeholder_element)
         return;
-    if (this->placeholder_value().has_value()) {
-        m_inner_text_element->set_inline_style(inner_text_style_when_hidden());
+    if (this->placeholder_value().has_value())
         m_placeholder_element->set_inline_style(placeholder_style_when_visible());
-    } else {
-        m_inner_text_element->set_inline_style(inner_text_style_when_visible());
+    else
         m_placeholder_element->set_inline_style(placeholder_style_when_hidden());
-    }
 }
 
 Utf16String HTMLInputElement::button_label() const
@@ -1179,14 +1146,32 @@ void HTMLInputElement::create_text_input_shadow_tree()
                 align-items: center;
                 white-space: pre;
                 border: none;
-                padding: 1px 2px;
             )~~~"sv);
         }
         element->set_inline_style(*style);
     }
     MUST(shadow_root->append_child(element));
 
-    // https://www.w3.org/TR/css-ui-4/#input-rules
+    auto text_container = element;
+    if (type_state() == TypeAttributeState::Number) {
+        text_container = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
+        {
+            static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
+            if (!style) {
+                style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
+                style->set_declarations_from_text(R"~~~(
+                    display: flex;
+                    align-items: center;
+                    flex: 1;
+                    min-width: 0;
+                )~~~"sv);
+            }
+            text_container->set_inline_style(*style);
+        }
+        MUST(element->append_child(*text_container));
+    }
+
+    // https://drafts.csswg.org/css-ui-4/#input-rules
     m_inner_text_element = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
     {
         static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
@@ -1195,7 +1180,6 @@ void HTMLInputElement::create_text_input_shadow_tree()
             style->set_declarations_from_text(R"~~~(
                 width: 100%;
                 height: 1lh;
-                align-items: center;
                 overflow: auto;
                 scrollbar-width: none;
                 text-overflow: clip;
@@ -1204,7 +1188,7 @@ void HTMLInputElement::create_text_input_shadow_tree()
         }
         m_inner_text_element->set_inline_style(*style);
     }
-    MUST(element->append_child(*m_inner_text_element));
+    MUST(text_container->append_child(*m_inner_text_element));
 
     m_text_node = realm().create<DOM::Text>(document(), m_value);
     if (type_state() == TypeAttributeState::Password)
@@ -1213,7 +1197,7 @@ void HTMLInputElement::create_text_input_shadow_tree()
     MUST(m_inner_text_element->append_child(*m_text_node));
 
     m_placeholder_element = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-    MUST(element->append_child(*m_placeholder_element));
+    MUST(text_container->append_child(*m_placeholder_element));
     m_placeholder_element->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::Placeholder);
 
     m_placeholder_text_node = realm().create<DOM::Text>(document(), Utf16String::from_utf8(placeholder()));
@@ -1712,7 +1696,7 @@ void HTMLInputElement::signal_a_type_change()
     // - A type change is signalled for the element.
     if (type_state() == TypeAttributeState::RadioButton && checked()) {
         root().for_each_in_inclusive_subtree_of_type<HTMLInputElement>([&](auto& element) {
-            if (element.checked() && &element != this && is_in_same_radio_button_group(*this, element))
+            if (element.checked() && &element != this && is_in_same_radio_button_group_as(element))
                 element.set_checked(false);
             return TraversalDecision::Continue;
         });
@@ -2095,7 +2079,7 @@ void HTMLInputElement::form_associated_element_was_inserted()
         // - The element becomes connected.
         if (type_state() == TypeAttributeState::RadioButton && checked()) {
             root().for_each_in_inclusive_subtree_of_type<HTMLInputElement>([&](auto& element) {
-                if (element.checked() && &element != this && is_in_same_radio_button_group(*this, element))
+                if (element.checked() && &element != this && is_in_same_radio_button_group_as(element))
                     element.set_checked(false);
                 return TraversalDecision::Continue;
             });
@@ -2203,7 +2187,7 @@ WebIDL::ExceptionOr<void> HTMLInputElement::cloned(DOM::Node& copy, bool subtree
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#radio-button-group
-static bool is_in_same_radio_button_group(HTML::HTMLInputElement const& a, HTML::HTMLInputElement const& b)
+bool HTMLInputElement::is_in_same_radio_button_group_as(HTML::HTMLInputElement const& other) const
 {
     auto non_empty_equals = [](auto const& value_a, auto const& value_b) {
         return !value_a.is_empty() && value_a == value_b;
@@ -2212,36 +2196,17 @@ static bool is_in_same_radio_button_group(HTML::HTMLInputElement const& a, HTML:
     // other input elements b that fulfill all of the following conditions:
     return (
         // - Both a and b are in the same tree.
-        &a.root() == &b.root()
+        &root() == &other.root()
         // - The input element b's type attribute is in the Radio Button state.
-        && a.type_state() == b.type_state()
-        && b.type_state() == HTMLInputElement::TypeAttributeState::RadioButton
+        && type_state() == other.type_state()
+        && other.type_state() == HTMLInputElement::TypeAttributeState::RadioButton
         // - Either a and b have the same form owner, or they both have no form owner.
-        && a.form() == b.form()
+        && form() == other.form()
         // - They both have a name attribute, their name attributes are not empty, and the
         // value of a's name attribute equals the value of b's name attribute.
-        && a.name().has_value()
-        && b.name().has_value()
-        && non_empty_equals(a.name().value(), b.name().value()));
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio)
-void HTMLInputElement::set_checked_within_group()
-{
-    if (checked())
-        return;
-
-    set_checked(true);
-
-    // No point iterating the tree if we have an empty name.
-    if (!name().has_value() || name()->is_empty())
-        return;
-
-    root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
-        if (element.checked() && &element != this && is_in_same_radio_button_group(*this, element))
-            element.set_checked(false);
-        return TraversalDecision::Continue;
-    });
+        && name().has_value()
+        && other.name().has_value()
+        && non_empty_equals(name().value(), other.name().value()));
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#the-input-element:legacy-pre-activation-behavior
@@ -2263,14 +2228,14 @@ void HTMLInputElement::legacy_pre_activation_behavior()
     //    checkedness to true.
     if (type_state() == TypeAttributeState::RadioButton) {
         root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
-            if (element.checked() && is_in_same_radio_button_group(*this, element)) {
+            if (element.checked() && is_in_same_radio_button_group_as(element)) {
                 m_legacy_pre_activation_behavior_checked_element_in_group = &element;
                 return TraversalDecision::Break;
             }
             return TraversalDecision::Continue;
         });
 
-        set_checked_within_group();
+        set_checked(true);
     }
 }
 
@@ -2293,8 +2258,8 @@ void HTMLInputElement::legacy_cancelled_activation_behavior()
         bool did_reselect_previous_element = false;
         if (m_legacy_pre_activation_behavior_checked_element_in_group) {
             auto& element_in_group = *m_legacy_pre_activation_behavior_checked_element_in_group;
-            if (is_in_same_radio_button_group(*this, element_in_group)) {
-                element_in_group.set_checked_within_group();
+            if (is_in_same_radio_button_group_as(element_in_group)) {
+                element_in_group.set_checked(true);
                 did_reselect_previous_element = true;
             }
 
@@ -3238,6 +3203,21 @@ bool HTMLInputElement::is_single_line() const
 
 bool HTMLInputElement::has_activation_behavior() const
 {
+    // https://html.spec.whatwg.org/multipage/input.html#the-input-element:activation-behaviour
+    // Input activation runs this element's input activation behavior, if any,
+    // and then popover target activation.
+    // https://html.spec.whatwg.org/multipage/input.html#button-state-(type=button)
+    // Button-state inputs have no input activation behavior.
+    //
+    // NB: Per spec, input elements have activation behavior even when those
+    //     steps are a no-op. However, making a no-op input button the
+    //     activation target prevents activation behavior on ancestor anchors.
+    //     For compatibility with other browsers, let plain input buttons yield
+    //     to ancestors.
+    if (type_state() == TypeAttributeState::Button
+        && !PopoverTargetAttributes::get_the_popover_target_element(const_cast<HTMLInputElement&>(*this)))
+        return false;
+
     return true;
 }
 
@@ -3575,7 +3555,7 @@ bool HTMLInputElement::suffering_from_being_missing() const
         // If an element in the radio button group is required, and all of the input elements in the radio button group
         // have a checkedness that is false, then the element is suffering from being missing.
         root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
-            if (is_in_same_radio_button_group(*this, element)) {
+            if (is_in_same_radio_button_group_as(element)) {
                 if (element.checked())
                     has_checkedness_false_for_all_elements_in_group = false;
                 if (element.has_attribute(HTML::AttributeNames::required))

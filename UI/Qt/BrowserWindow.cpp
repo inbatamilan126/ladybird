@@ -235,8 +235,9 @@ static QIcon const& app_icon()
     return icon;
 }
 
-BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow is_popup_window, Tab* parent_tab, Optional<u64> page_index)
-    : m_tabs_container(new TabWidget(this))
+BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow is_popup_window, WebView::IsPrivate is_private, Tab* parent_tab, Optional<u64> page_index)
+    : m_is_private(is_private)
+    , m_tabs_container(new TabWidget(this))
     , m_is_popup_window(is_popup_window)
 {
     auto& application = WebView::Application::the();
@@ -276,7 +277,7 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
     auto* file_menu = menuBar()->addMenu("&File");
 
     m_new_tab_action = new QAction("New &Tab", this);
-    m_new_tab_action->setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::AddTab));
+    m_new_tab_action->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_T));
     m_hamburger_menu->addAction(m_new_tab_action);
     file_menu->addAction(m_new_tab_action);
 
@@ -284,6 +285,11 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
     m_new_window_action->setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::New));
     m_hamburger_menu->addAction(m_new_window_action);
     file_menu->addAction(m_new_window_action);
+
+    m_new_private_window_action = new QAction("New Pri&vate Window", this);
+    m_new_private_window_action->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_N));
+    m_hamburger_menu->addAction(m_new_private_window_action);
+    file_menu->addAction(m_new_private_window_action);
 
     m_reopen_recently_closed_tab_action = new QAction("&Reopen Recently Closed Tab", this);
     m_reopen_recently_closed_tab_action->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_T));
@@ -385,6 +391,9 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
     menuBar()->addMenu(m_bookmarks_menu);
 
     m_history_menu = create_application_menu(*this, application.history_menu());
+    QObject::connect(m_history_menu, &QMenu::aboutToShow, this, [this] {
+        update_history_menu(*m_history_menu, m_current_tab ? &m_current_tab->view() : nullptr);
+    });
     m_hamburger_menu->addMenu(m_history_menu);
     menuBar()->addMenu(m_history_menu);
 
@@ -420,7 +429,10 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
         Application::the().open_new_tab();
     });
     QObject::connect(m_new_window_action, &QAction::triggered, this, [] {
-        Application::the().open_new_window();
+        Application::the().open_new_window(WebView::IsPrivate::No);
+    });
+    QObject::connect(m_new_private_window_action, &QAction::triggered, this, [] {
+        Application::the().open_new_window(WebView::IsPrivate::Yes);
     });
     QObject::connect(m_reopen_recently_closed_tab_action, &QAction::triggered, this, [] {
         Application::the().reopen_recently_closed_tab();
@@ -437,7 +449,7 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
     QObject::connect(m_tabs_container, &TabWidget::current_tab_changed, this, [this](int index) {
         auto* tab = m_tabs_container->tab(index);
         if (tab)
-            setWindowTitle(QString("%1 - Ladybird").arg(tab->title()));
+            update_window_title(tab->title());
 
         set_current_tab(tab);
         if (tab) {
@@ -617,10 +629,6 @@ void BrowserWindow::initialize_tab(Tab* tab)
             new_tab_from_url(ak_url_from_qurl(urls[i]), Web::HTML::ActivateTab::No);
     });
 
-    QObject::connect(&tab->view(), &WebContentView::native_window_pointer_event, this, [this] {
-        refresh_resize_cursor_at_current_position();
-    });
-
     tab->view().on_new_web_view = [this, tab](auto activate_tab, Web::HTML::WebViewHints hints, Optional<u64> page_index) {
         if (hints.popup) {
             WindowConfiguration configuration {
@@ -629,7 +637,7 @@ void BrowserWindow::initialize_tab(Tab* tab)
                 .width = hints.width,
                 .height = hints.height,
             };
-            auto& window = Application::the().new_window({}, configuration, IsPopupWindow::Yes, tab, AK::move(page_index));
+            auto& window = Application::the().new_window({}, configuration, IsPopupWindow::Yes, m_is_private, tab, AK::move(page_index));
             return window.current_tab()->view().handle();
         }
         auto& new_tab = new_child_tab(activate_tab, *tab, page_index);
@@ -673,6 +681,9 @@ void BrowserWindow::move_tab_to_window(int index, BrowserWindow& target_window, 
         return;
     }
 
+    if (is_private() != target_window.is_private())
+        return;
+
     auto* tab = m_tabs_container->tab(index);
     uninitialize_tab(tab);
     m_tabs_container->take_tab(index);
@@ -700,7 +711,7 @@ void BrowserWindow::detach_tab_to_new_window(int index, QPoint global_position)
         .maximized = isMaximized(),
     };
 
-    auto& window = Application::the().new_window({}, configuration);
+    auto& window = Application::the().new_window({}, configuration, IsPopupWindow::No, m_is_private);
     move_tab_to_window(index, window, 0);
 }
 
@@ -747,8 +758,12 @@ bool BrowserWindow::definitely_close_tab(int index)
     auto* tab = m_tabs_container->tab(index);
     auto url = tab->view().url();
     m_tabs_container->remove_tab(index);
-    Application::history_store().record_closed_tab(url);
-    Application::the().update_reopen_recently_closed_actions();
+
+    if (m_is_private == WebView::IsPrivate::No) {
+        Application::history_store(WebView::IsPrivate::No).record_closed_tab(url);
+        Application::the().update_reopen_recently_closed_actions();
+    }
+
     tab->deleteLater();
 
     if (m_tabs_container->count() == 0) {
@@ -764,9 +779,9 @@ void BrowserWindow::update_reopen_recently_closed_action()
     if (!m_reopen_recently_closed_tab_action)
         return;
 
-    auto recently_closed_entry = Application::history_store().most_recently_closed_entry();
+    auto recently_closed_entry = Application::history_store(WebView::IsPrivate::No).most_recently_closed_entry();
     m_reopen_recently_closed_tab_action->setText("&Reopen Recently Closed Tab");
-    m_reopen_recently_closed_tab_action->setEnabled(recently_closed_entry.has_value());
+    m_reopen_recently_closed_tab_action->setEnabled(m_is_private == WebView::IsPrivate::No && recently_closed_entry.has_value());
 }
 
 void BrowserWindow::move_tab(int old_index, int new_index)
@@ -880,6 +895,14 @@ void BrowserWindow::display_metadata_changed(Optional<u64> display_id, qreal ref
     });
 }
 
+void BrowserWindow::update_window_title(QString const& title)
+{
+    char const* format = is_private() == WebView::IsPrivate::Yes
+        ? "%1 - Ladybird (Private Browsing)"
+        : "%1 - Ladybird";
+    setWindowTitle(QString(format).arg(title));
+}
+
 void BrowserWindow::tab_title_changed(int index, QString const& title)
 {
     // NOTE: Qt uses ampersands for shortcut keys in tab titles, so we need to escape them.
@@ -890,7 +913,7 @@ void BrowserWindow::tab_title_changed(int index, QString const& title)
     m_tabs_container->set_tab_tooltip(index, title);
 
     if (m_tabs_container->current_index() == index)
-        setWindowTitle(QString("%1 - Ladybird").arg(title));
+        update_window_title(title);
 }
 
 void BrowserWindow::tab_favicon_changed(int index, QIcon const& icon)
@@ -1205,6 +1228,12 @@ bool BrowserWindow::event(QEvent* event)
 
 bool BrowserWindow::eventFilter(QObject* object, QEvent* event)
 {
+    if (auto* native_window = as_if<QWindow>(object)) {
+        if (filter_native_window_event(*native_window, *event))
+            return true;
+        return QMainWindow::eventFilter(object, event);
+    }
+
     auto* widget = as_if<QWidget>(object);
     if (!widget || widget->window() != this)
         return QMainWindow::eventFilter(object, event);
@@ -1291,6 +1320,56 @@ bool BrowserWindow::eventFilter(QObject* object, QEvent* event)
         return true;
 
     return QMainWindow::eventFilter(object, event);
+}
+
+bool BrowserWindow::filter_native_window_event(QWindow& window, QEvent& event)
+{
+    if (!uses_client_side_decorations())
+        return false;
+
+    auto* window_handle = windowHandle();
+    if (!window_handle)
+        return false;
+
+    bool window_is_embedded_in_this_window = false;
+    for (auto const* ancestor = window.parent(); ancestor; ancestor = ancestor->parent()) {
+        if (ancestor == window_handle) {
+            window_is_embedded_in_this_window = true;
+            break;
+        }
+    }
+    if (!window_is_embedded_in_this_window)
+        return false;
+
+    switch (event.type()) {
+    case QEvent::Enter:
+        update_resize_cursor(mapFromGlobal(QCursor::pos()));
+        return false;
+    case QEvent::MouseMove:
+        update_resize_cursor(mapFromGlobal(static_cast<QMouseEvent const&>(event).globalPosition().toPoint()));
+        return false;
+    case QEvent::Leave: {
+        auto position = mapFromGlobal(QCursor::pos());
+        if (rect().contains(position))
+            update_resize_cursor(position);
+        else
+            clear_resize_cursor();
+        return false;
+    }
+    case QEvent::MouseButtonPress: {
+        auto const& mouse_event = static_cast<QMouseEvent const&>(event);
+        if (mouse_event.button() != Qt::LeftButton || isMaximized() || isFullScreen())
+            return false;
+
+        auto edges = resize_edges_for_position(mapFromGlobal(mouse_event.globalPosition().toPoint()));
+        if (edges == Qt::Edges {})
+            return false;
+
+        return window_handle->startSystemResize(edges);
+    }
+    default:
+        return false;
+    }
 }
 
 bool BrowserWindow::position_is_in_rounded_corner_cutout(QPoint const& position) const
@@ -1608,15 +1687,18 @@ void BrowserWindow::closeEvent(QCloseEvent* event)
 
     Optional<Vector<URL::URL>> recently_closed_window_urls;
     size_t recently_closed_window_active_tab_index { 0 };
-    if (m_should_record_closed_window_on_close && m_tabs_container->count() > 0) {
-        recently_closed_window_urls = recently_closed_urls_for_window(*m_tabs_container);
-        recently_closed_window_active_tab_index = static_cast<size_t>(m_tabs_container->current_index());
-    }
 
-    if (m_is_popup_window == IsPopupWindow::No) {
-        Settings::the()->set_last_position(pos());
-        Settings::the()->set_last_size(size());
-        Settings::the()->set_is_maximized(isMaximized());
+    if (m_is_private == WebView::IsPrivate::No) {
+        if (m_should_record_closed_window_on_close && m_tabs_container->count() > 0) {
+            recently_closed_window_urls = recently_closed_urls_for_window(*m_tabs_container);
+            recently_closed_window_active_tab_index = static_cast<size_t>(m_tabs_container->current_index());
+        }
+
+        if (m_is_popup_window == IsPopupWindow::No) {
+            Settings::the()->set_last_position(pos());
+            Settings::the()->set_last_size(size());
+            Settings::the()->set_is_maximized(isMaximized());
+        }
     }
 
     QObject::deleteLater();
@@ -1624,7 +1706,7 @@ void BrowserWindow::closeEvent(QCloseEvent* event)
     QMainWindow::closeEvent(event);
 
     if (event->isAccepted() && recently_closed_window_urls.has_value()) {
-        Application::history_store().record_closed_window(recently_closed_window_urls.release_value(), recently_closed_window_active_tab_index);
+        Application::history_store(WebView::IsPrivate::No).record_closed_window(recently_closed_window_urls.release_value(), recently_closed_window_active_tab_index);
         Application::the().update_reopen_recently_closed_actions();
     }
 }

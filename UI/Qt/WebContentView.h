@@ -16,6 +16,7 @@
 #include <LibGfx/Rect.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Forward.h>
+#include <LibWebView/PrivateBrowsing.h>
 #include <LibWebView/ViewImplementation.h>
 
 #include <QMenu>
@@ -49,6 +50,7 @@ using WebContentViewBase = QWidget;
 #endif
 
 struct WebContentViewInitialState {
+    WebView::IsPrivate is_private { WebView::IsPrivate::No };
     double maximum_frames_per_second { 60.0 };
     Optional<u64> display_id;
 };
@@ -107,8 +109,6 @@ public slots:
 
 signals:
     void urls_dropped(QList<QUrl> const&);
-
-    void native_window_pointer_event();
 
 private:
     // ^WebView::ViewImplementation
@@ -191,6 +191,7 @@ private:
     void update_vulkan_window_geometry();
     void set_vulkan_window_cursor(QCursor const&);
     bool handle_vulkan_window_event(QEvent*);
+    void set_vulkan_window_container_visible(bool);
 
     VulkanWindow* m_vulkan_window { nullptr };
     QWidget* m_vulkan_window_container { nullptr };

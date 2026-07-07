@@ -55,10 +55,8 @@
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/FontFaceSet.h>
-#include <LibWeb/CSS/Invalidation/HasMutationInvalidator.h>
 #include <LibWeb/CSS/Invalidation/MediaQueryInvalidator.h>
 #include <LibWeb/CSS/Invalidation/PseudoClassInvalidator.h>
-#include <LibWeb/CSS/Invalidation/SlotInvalidator.h>
 #include <LibWeb/CSS/Invalidation/StyleInvalidator.h>
 #include <LibWeb/CSS/InvalidationSet.h>
 #include <LibWeb/CSS/MediaQueryList.h>
@@ -66,7 +64,6 @@
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/SelectorEngine.h>
 #include <LibWeb/CSS/StyleComputer.h>
-#include <LibWeb/CSS/StyleInvalidation.h>
 #include <LibWeb/CSS/StyleSheetIdentifier.h>
 #include <LibWeb/CSS/StyleSheetList.h>
 #include <LibWeb/CSS/StyleValues/ColorSchemeStyleValue.h>
@@ -105,6 +102,7 @@
 #include <LibWeb/DOM/Position.h>
 #include <LibWeb/DOM/ProcessingInstruction.h>
 #include <LibWeb/DOM/Range.h>
+#include <LibWeb/DOM/SelectorQuery.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/DOM/TreeWalker.h>
@@ -197,7 +195,7 @@
 #include <LibWeb/Painting/DisplayListCommand.h>
 #include <LibWeb/Painting/DisplayListRecorder.h>
 #include <LibWeb/Painting/HitTestDisplayList.h>
-#include <LibWeb/Painting/PaintableBox.h>
+#include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Painting/StackingContext.h>
 #include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
@@ -762,6 +760,8 @@ void Document::visit_edges(Cell::Visitor& visitor)
 
     visitor.visit(m_potentially_named_elements);
     m_anchor_name_map.visit_edges(visitor);
+    if (m_query_selector_result_cache)
+        m_query_selector_result_cache->visit_edges(visitor);
 
     for (auto& event : m_pending_animation_event_queue) {
         visitor.visit(event.event);
@@ -1944,8 +1944,8 @@ void Document::update_layout(UpdateLayoutReason reason)
         }
 
         // Collect elements with content-visibility: auto. This is used in the HTML event loop to avoid traversing the whole tree every time.
-        Vector<WeakPtr<Painting::PaintableBox>> paintable_boxes_with_auto_content_visibility;
-        unsafe_paintable()->for_each_in_subtree_of_type<Painting::PaintableBox>([&](auto& paintable_box) {
+        Vector<WeakPtr<Painting::Paintable>> paintable_boxes_with_auto_content_visibility;
+        unsafe_paintable()->for_each_in_subtree_of_type<Painting::Paintable>([&](auto& paintable_box) {
             if (paintable_box.dom_node()
                 && paintable_box.dom_node()->is_element()
                 && paintable_box.computed_values().content_visibility() == CSS::ContentVisibility::Auto) {
@@ -2000,7 +2000,7 @@ void Document::clear_devtools_layout_inspection_data()
     if (!paintable)
         return;
 
-    paintable->for_each_in_subtree_of_type<Painting::PaintableBox>([](auto& paintable_box) {
+    paintable->for_each_in_subtree_of_type<Painting::Paintable>([](auto& paintable_box) {
         paintable_box.set_grid_layout_data(nullptr);
         paintable_box.set_flex_layout_data(nullptr);
         return TraversalDecision::Continue;
@@ -2020,227 +2020,9 @@ bool Document::layout_is_up_to_date() const
         && m_svg_roots_needing_relayout.is_empty();
 }
 
-static void apply_element_style_invalidation_after_style_change(Element& element, CSS::RequiredInvalidationAfterStyleChange const& invalidation, bool invalidate_assigned_slottables, bool invalidate_descendant_slots)
+void Document::update_style_computer_viewport_rect()
 {
-    if (invalidate_assigned_slottables)
-        CSS::Invalidation::invalidate_assigned_slottables_after_slot_style_change(element);
-    if (invalidate_descendant_slots && (invalidation.inherited_style_changed || invalidation.rebuild_layout_tree))
-        CSS::Invalidation::invalidate_assigned_slottables_for_descendant_slots_after_inherited_style_change(element);
-
-    if (invalidation.relayout)
-        element.set_needs_layout_update(SetNeedsLayoutReason::StyleChange);
-    if (invalidation.rebuild_layout_tree) {
-        // Mark the parent to handle display changes to/from contents correctly.
-        if (auto parent_element = element.parent_element())
-            parent_element->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::StyleChange);
-        else
-            element.set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::StyleChange);
-    }
-
-    element.set_needs_style_update(false);
-}
-
-static void apply_document_style_invalidation_after_style_change(Document& document, CSS::RequiredInvalidationAfterStyleChange const& invalidation)
-{
-    if (invalidation.repaint
-        || invalidation.rebuild_stacking_context_tree
-        || invalidation.relayout
-        || invalidation.rebuild_layout_tree)
-        document.set_needs_to_record_display_list();
-    if (invalidation.rebuild_accumulated_visual_contexts)
-        document.set_needs_accumulated_visual_contexts_update(true);
-    if (invalidation.rebuild_stacking_context_tree)
-        document.invalidate_stacking_context_tree();
-}
-
-[[nodiscard]] static CSS::RequiredInvalidationAfterStyleChange update_style_recursively(
-    Node& node,
-    CSS::StyleComputer& style_computer,
-    bool needs_inherited_style_update,
-    bool recompute_elements_depending_on_custom_properties,
-    bool parent_display_changed,
-    bool ancestor_needs_descendant_style_recompute)
-{
-    bool const needs_full_style_update = node.document().needs_full_style_update();
-    CSS::RequiredInvalidationAfterStyleChange invalidation;
-
-    if (node.is_element())
-        style_computer.push_ancestor(static_cast<Element const&>(node));
-
-    // NOTE: If the current node has `display:none`, we can disregard all invalidation
-    //       caused by its children, as they will not be rendered anyway.
-    //       We will still recompute style for the children, though.
-    bool is_display_none = false;
-
-    bool did_change_custom_properties = false;
-    CSS::RequiredInvalidationAfterStyleChange node_invalidation;
-    if (is<Element>(node)) {
-        auto& element = static_cast<Element&>(node);
-
-        // FIXME: We can avoid some unnecessary re-computations by, skipping if a) the contained if() functions don't
-        //        include media conditions, or b) the data used to resolve media queries hasn't changed.
-        bool const needs_style_update_due_to_if_media = element.style_uses_if_css_function();
-
-        if (needs_full_style_update
-            || node.needs_style_update()
-            || parent_display_changed
-            || ancestor_needs_descendant_style_recompute
-            || (recompute_elements_depending_on_custom_properties && (element.style_uses_var_css_function() || element.style_uses_inherit_css_function()))
-            || needs_style_update_due_to_if_media) {
-            node_invalidation = element.recompute_style(did_change_custom_properties);
-        } else {
-            if (needs_inherited_style_update)
-                node_invalidation = element.recompute_inherited_style(ScheduleAnimationUpdate::Yes);
-            if (recompute_elements_depending_on_custom_properties && element.refresh_inherited_custom_property_data())
-                did_change_custom_properties = true;
-        }
-        is_display_none = static_cast<Element&>(node).computed_properties()->display().is_none();
-
-        apply_element_style_invalidation_after_style_change(element, node_invalidation, !node_invalidation.is_none(), !needs_inherited_style_update);
-    }
-    if (!node.is_element())
-        node.set_needs_style_update(false);
-    invalidation |= node_invalidation;
-
-    if (did_change_custom_properties) {
-        recompute_elements_depending_on_custom_properties = true;
-    }
-
-    bool children_need_inherited_style_update = !invalidation.is_none();
-    if (!node.is_element())
-        children_need_inherited_style_update |= needs_inherited_style_update;
-    // NB: When display changes to/from flex/grid/contents, children may need to be blockified or un-blockified.
-    //     This requires a full style recompute, not just inherited style update.
-    bool children_need_full_style_recompute = node_invalidation.rebuild_layout_tree;
-    bool descendant_style_recompute_needed = ancestor_needs_descendant_style_recompute || node_invalidation.recompute_descendant_styles;
-
-    // OPTIMIZATION: Descendants of a display:none element are not rendered and their computed style is not observable
-    //               except through on-demand reads, which call Document::update_style_for_element to refresh the path
-    //               lazily. We can therefore skip the descent entirely. The exception is when display itself just
-    //               changed or the document needs a full style update. In those cases descendants must be re-cascaded
-    //               eagerly.
-    bool const skip_display_none_descent = is_display_none && !needs_full_style_update && !children_need_full_style_recompute;
-
-    if (!skip_display_none_descent
-        && (needs_full_style_update
-            || node.child_needs_style_update()
-            || children_need_inherited_style_update
-            || recompute_elements_depending_on_custom_properties
-            || children_need_full_style_recompute
-            || descendant_style_recompute_needed)) {
-        if (node.is_element()) {
-            if (auto shadow_root = static_cast<DOM::Element&>(node).shadow_root()) {
-                bool shadow_tree_children_need_inherited_style_update = node_invalidation.inherited_style_changed
-                    || (!node_invalidation.is_none() && shadow_root->children_may_depend_on_non_inherited_property_inheritance());
-                if (needs_full_style_update
-                    || shadow_root->needs_style_update()
-                    || shadow_root->child_needs_style_update()
-                    || shadow_tree_children_need_inherited_style_update
-                    || recompute_elements_depending_on_custom_properties
-                    || children_need_full_style_recompute
-                    || descendant_style_recompute_needed) {
-                    auto subtree_invalidation = update_style_recursively(
-                        *shadow_root,
-                        style_computer,
-                        shadow_tree_children_need_inherited_style_update,
-                        recompute_elements_depending_on_custom_properties,
-                        children_need_full_style_recompute,
-                        descendant_style_recompute_needed);
-                    if (!is_display_none)
-                        invalidation |= subtree_invalidation;
-                }
-            }
-        }
-
-        node.for_each_child([&](auto& child) {
-            if (needs_full_style_update
-                || child.needs_style_update()
-                || children_need_inherited_style_update
-                || child.child_needs_style_update()
-                || recompute_elements_depending_on_custom_properties
-                || children_need_full_style_recompute
-                || descendant_style_recompute_needed) {
-                auto subtree_invalidation = update_style_recursively(
-                    child,
-                    style_computer,
-                    children_need_inherited_style_update,
-                    recompute_elements_depending_on_custom_properties,
-                    children_need_full_style_recompute,
-                    descendant_style_recompute_needed);
-                if (!is_display_none)
-                    invalidation |= subtree_invalidation;
-            }
-            return IterationDecision::Continue;
-        });
-    }
-
-    if (!skip_display_none_descent)
-        node.set_child_needs_style_update(false);
-
-    if (node.is_element())
-        style_computer.pop_ancestor(static_cast<Element const&>(node));
-
-    return invalidation;
-}
-
-void Document::update_style()
-{
-    // NOTE: If our parent document needs a relayout, we must do that *first*. This is required as it may cause the
-    // viewport to change which will can affect media query evaluation and the value of the `vw` unit.
-    if (auto navigable = this->navigable(); navigable && navigable->container() && &navigable->container()->document() != this)
-        navigable->container()->document().update_layout(UpdateLayoutReason::ChildDocumentStyleUpdate);
-
-    if (!browsing_context())
-        return;
-
-    // Fetch the viewport rect once, instead of repeatedly, during style computation.
     style_computer().set_viewport_rect({}, viewport_rect());
-
-    update_animated_style_if_needed();
-
-    // Associated with each top-level browsing context is a current transition generation that is incremented on each
-    // style change event. [CSS-Transitions-2]
-    m_transition_generation++;
-
-    if (m_needs_invalidation_of_elements_affected_by_has) {
-        m_needs_invalidation_of_elements_affected_by_has = false;
-        CSS::Invalidation::invalidate_style_for_pending_has_mutations(*this);
-    }
-
-    if (!m_style_invalidator->has_pending_invalidations() && !needs_full_style_update() && !needs_style_update() && !child_needs_style_update() && !m_needs_media_rule_evaluation)
-        return;
-
-    // NOTE: If this is a document hosting <template> contents, style update is unnecessary.
-    if (m_created_for_appropriate_template_contents)
-        return;
-
-    if (m_needs_media_rule_evaluation)
-        evaluate_media_rules();
-
-    if (!m_style_invalidator->has_pending_invalidations() && !needs_full_style_update() && !needs_style_update() && !child_needs_style_update())
-        return;
-
-    m_style_invalidator->invalidate(*this);
-
-    build_registered_properties_cache();
-
-    CSS::RequiredInvalidationAfterStyleChange invalidation;
-    constexpr size_t max_style_update_passes = 8;
-    for (size_t style_update_pass = 0; style_update_pass < max_style_update_passes; ++style_update_pass) {
-        style_computer().reset_has_result_cache();
-        style_computer().reset_ancestor_filter();
-
-        invalidation |= update_style_recursively(*this, style_computer(), false, false, false, false);
-        m_needs_full_style_update = false;
-
-        if (!m_style_invalidator->has_pending_invalidations() && !needs_style_update() && !child_needs_style_update())
-            break;
-
-        m_style_invalidator->invalidate(*this);
-    }
-
-    apply_document_style_invalidation_after_style_change(*this, invalidation);
-    update_animated_style_if_needed();
 }
 
 static bool element_or_pseudo_depends_on_viewport_metrics(Element const& element)
@@ -2272,224 +2054,6 @@ void Document::invalidate_style_for_viewport_change()
 
         return TraversalDecision::Continue;
     });
-}
-
-void Document::update_style_if_needed_for_element(AbstractElement const& abstract_element)
-{
-    if (element_needs_style_update(abstract_element))
-        update_style();
-}
-
-static void mark_direct_children_for_style_update(Element& element)
-{
-    if (auto shadow_root = element.shadow_root()) {
-        shadow_root->for_each_child([](auto& child) {
-            child.set_needs_style_update(true);
-            return IterationDecision::Continue;
-        });
-    }
-
-    element.for_each_child([](auto& child) {
-        child.set_needs_style_update(true);
-        return IterationDecision::Continue;
-    });
-}
-
-static void apply_targeted_style_invalidation(Element& element, CSS::RequiredInvalidationAfterStyleChange const& invalidation, bool did_change_custom_properties, bool descendant_style_recompute_needed)
-{
-    apply_element_style_invalidation_after_style_change(element, invalidation, !invalidation.is_none() || did_change_custom_properties, true);
-
-    if (!invalidation.is_none() || did_change_custom_properties || descendant_style_recompute_needed || invalidation.recompute_descendant_styles)
-        mark_direct_children_for_style_update(element);
-
-    apply_document_style_invalidation_after_style_change(element.document(), invalidation);
-}
-
-static CSS::RequiredInvalidationAfterStyleChange recompute_style_for_targeted_style_update(Element& element, bool& did_change_custom_properties)
-{
-    if (element.parent())
-        return element.recompute_style(did_change_custom_properties);
-
-    auto new_computed_properties = element.document().style_computer().compute_style({ element }, did_change_custom_properties);
-    element.set_computed_properties({}, move(new_computed_properties));
-    element.set_needs_style_update(false);
-    return {};
-}
-
-CSS::ComputedProperties const* Document::update_style_for_element(AbstractElement const& abstract_element, StyleUpdateMode mode)
-{
-    // Refresh computed properties for an abstract element without requiring every unrelated dirty element in the
-    // document to be resolved. This walks the flat-tree inheritance chain and re-cascades from the rootmost stale
-    // element on the path back down to the target. Normal mode also re-cascades the target path under display:none
-    // ancestors, because the regular document traversal may leave those descendants stale.
-
-    if (auto navigable = this->navigable(); navigable && navigable->container() && &navigable->container()->document() != this)
-        navigable->container()->document().update_layout(UpdateLayoutReason::ChildDocumentStyleUpdate);
-
-    if (browsing_context()) {
-        style_computer().set_viewport_rect({}, viewport_rect());
-
-        update_animated_style_if_needed();
-
-        // Media query evaluation can enqueue normal style invalidations, so do it before deciding whether the full
-        // style traversal needs to run.
-        if (m_needs_media_rule_evaluation)
-            evaluate_media_rules();
-
-        if (!m_is_running_update_layout
-            && (needs_full_style_update()
-                || m_needs_invalidation_of_elements_affected_by_has
-                || m_style_invalidator->has_pending_invalidations()
-                || needs_style_update())) {
-            update_style();
-        }
-    }
-
-    // Single walk up the inheritance chain: collect each ancestor and remember the index of the topmost display:none
-    // entry seen. Pseudo-element styles are refreshed when the originating element is recomputed, so don't put the pseudo
-    // on the path.
-    GC::RootVector<GC::Ref<Element>> inheritance_chain;
-    if (!abstract_element.pseudo_element().has_value())
-        inheritance_chain.append(const_cast<Element&>(abstract_element.element()));
-
-    Optional<size_t> topmost_display_none_index;
-    Optional<size_t> topmost_element_requiring_style;
-    bool ancestor_needs_descendant_style_recompute = false;
-    for (auto cursor = abstract_element.element_to_inherit_style_from(); cursor.has_value(); cursor = cursor->element_to_inherit_style_from()) {
-        auto& ancestor = const_cast<Element&>(cursor->element());
-        inheritance_chain.append(ancestor);
-    }
-
-    for (size_t i = inheritance_chain.size(); i > 0; --i) {
-        auto& ancestor = inheritance_chain[i - 1];
-        if (!topmost_element_requiring_style.has_value()
-            && (ancestor_needs_descendant_style_recompute
-                || ancestor->needs_style_update()
-                || !ancestor->computed_properties())) {
-            topmost_element_requiring_style = i - 1;
-        }
-
-        if (ancestor->entire_subtree_needs_style_update()) {
-            if (!topmost_element_requiring_style.has_value())
-                topmost_element_requiring_style = i - 1;
-            ancestor_needs_descendant_style_recompute = true;
-        }
-
-        if (auto const properties = ancestor->computed_properties(); properties && properties->display().is_none()) {
-            topmost_display_none_index = i - 1;
-            if (mode == StyleUpdateMode::StopAtDisplayNone && !topmost_element_requiring_style.has_value())
-                return nullptr;
-        }
-    }
-
-    Optional<size_t> topmost_element_to_recompute = topmost_element_requiring_style;
-    if (mode == StyleUpdateMode::Normal && topmost_display_none_index.has_value()) {
-        if (!topmost_element_to_recompute.has_value() && *topmost_display_none_index > 0)
-            topmost_element_to_recompute = *topmost_display_none_index - 1;
-    }
-
-    if (!topmost_element_to_recompute.has_value()) {
-        if (mode == StyleUpdateMode::Normal && !inheritance_chain.is_empty())
-            topmost_element_to_recompute = 0;
-        else
-            return abstract_element.computed_properties();
-    }
-
-    style_computer().reset_has_result_cache();
-
-    // Re-cascading the inheritance chain requires the style computer's ancestor filter to reflect each recomputed
-    // element's DOM ancestors, so that descendant-combinator selectors match correctly. The filter is empty at this
-    // point because the normal top-down `update_style` traversal skipped the display:none subtree, so we have to seed
-    // it ourselves.
-    GC::RootVector<GC::Ref<Element>> ancestor_chain;
-    for (auto* cursor = inheritance_chain[*topmost_element_to_recompute]->parent_or_shadow_host_element(); cursor; cursor = cursor->parent_or_shadow_host_element())
-        ancestor_chain.append(*cursor);
-
-    auto& style_computer = this->style_computer();
-    for (size_t i = ancestor_chain.size(); i > 0; --i)
-        style_computer.push_ancestor(ancestor_chain[i - 1]);
-
-    GC::RootVector<GC::Ref<Element>> pushed_path_ancestors;
-
-    ScopeGuard pop_ancestor_chain = [&] {
-        for (auto& ancestor : ancestor_chain)
-            style_computer.pop_ancestor(ancestor);
-    };
-
-    ScopeGuard pop_path_ancestors = [&] {
-        for (auto& ancestor : pushed_path_ancestors)
-            style_computer.pop_ancestor(ancestor);
-    };
-
-    bool descendant_style_recompute_needed = false;
-    for (size_t i = *topmost_element_to_recompute + 1; i > 0; --i) {
-        auto& element = inheritance_chain[i - 1];
-        bool did_change_custom_properties = false;
-        auto invalidation = recompute_style_for_targeted_style_update(element, did_change_custom_properties);
-        apply_targeted_style_invalidation(element, invalidation, did_change_custom_properties, descendant_style_recompute_needed);
-
-        descendant_style_recompute_needed |= invalidation.recompute_descendant_styles;
-
-        if (element->computed_properties()->display().is_none()) {
-            if (mode == StyleUpdateMode::StopAtDisplayNone)
-                return nullptr;
-            descendant_style_recompute_needed = false;
-        }
-
-        if (did_change_custom_properties || invalidation.rebuild_layout_tree)
-            descendant_style_recompute_needed = true;
-
-        if (i > 1) {
-            style_computer.push_ancestor(element);
-            pushed_path_ancestors.append(element);
-        }
-    }
-
-    return abstract_element.computed_properties();
-}
-
-bool Document::element_needs_style_update(AbstractElement const& abstract_element) const
-{
-    // If there are document-level reasons to update style, we can't skip.
-    if (m_needs_full_style_update)
-        return true;
-    if (m_needs_animated_style_update)
-        return true;
-    if (m_needs_invalidation_of_elements_affected_by_has)
-        return true;
-    if (m_needs_media_rule_evaluation)
-        return true;
-    if (m_style_invalidator->has_pending_invalidations())
-        return true;
-
-    // Check the element itself.
-    if (abstract_element.element().needs_style_update())
-        return true;
-    if (abstract_element.element().entire_subtree_needs_style_update())
-        return true;
-
-    // Walk the inheritance ancestor chain. We use element_to_inherit_style_from()
-    // because style inheritance follows the flat tree (slotted elements inherit
-    // from their assigned slot, not their DOM parent). If any ancestor on the
-    // path has its style marked dirty, the target element's computed style could
-    // change via inherited properties, so we must update.
-    for (auto ancestor = abstract_element.element_to_inherit_style_from(); ancestor.has_value(); ancestor = ancestor->element_to_inherit_style_from()) {
-        if (ancestor->element().needs_style_update())
-            return true;
-        if (ancestor->element().entire_subtree_needs_style_update())
-            return true;
-    }
-
-    // If the navigable has a container and that container needs a style update, then we need one as well, since the
-    // container's style can affect this element (e.g. via media queries or viewport units).
-    if (auto navigable = this->navigable()) {
-        if (auto container = navigable->container()) {
-            if (container->document().element_needs_style_update(AbstractElement { *container }))
-                return true;
-        }
-    }
-
-    return false;
 }
 
 void Document::update_animated_style_if_needed()
@@ -2546,8 +2110,21 @@ void Document::update_paint_and_hit_testing_properties_if_needed()
 
     if (m_needs_accumulated_visual_contexts_update) {
         m_needs_accumulated_visual_contexts_update = false;
+        m_paintable_boxes_needing_visual_context_value_update.clear_with_capacity();
         if (auto paintable = this->unsafe_paintable()) {
             paintable->assign_accumulated_visual_contexts();
+        }
+    } else if (!m_paintable_boxes_needing_visual_context_value_update.is_empty()) {
+        auto paintable_boxes = move(m_paintable_boxes_needing_visual_context_value_update);
+        if (auto paintable = this->unsafe_paintable()) {
+            for (auto const& weak_paintable_box : paintable_boxes) {
+                auto paintable_box = weak_paintable_box.strong_ref();
+                if (!paintable_box || !paintable->update_accumulated_visual_context_values(*paintable_box)) {
+                    // Structure changed after all; rebuild the whole tree.
+                    paintable->assign_accumulated_visual_contexts();
+                    break;
+                }
+            }
         }
     }
 }
@@ -2846,7 +2423,7 @@ static CSSPixelPoint hover_event_page_offset(Optional<HoverEventData> const& hov
 // https://drafts.csswg.org/cssom-view/#dom-mouseevent-offsetx
 static CSSPixelPoint compute_mouse_event_offset(CSSPixelPoint position, Painting::Paintable const& paintable)
 {
-    auto inverse_transform_point = [](Painting::PaintableBox const& paintable_box, CSSPixelPoint position) -> Optional<CSSPixelPoint> {
+    auto inverse_transform_point = [](Painting::Paintable const& paintable_box, CSSPixelPoint position) -> Optional<CSSPixelPoint> {
         auto viewport_paintable = paintable_box.document().unsafe_paintable();
         if (!viewport_paintable || !viewport_paintable->has_visual_context_tree())
             return {};
@@ -2858,13 +2435,8 @@ static CSSPixelPoint compute_mouse_event_offset(CSSPixelPoint position, Painting
     };
 
     CSSPixelPoint offset_position = position;
-    if (auto const* paintable_box = as_if<Painting::PaintableBox>(paintable)) {
-        if (auto transformed_position = inverse_transform_point(*paintable_box, position); transformed_position.has_value())
-            offset_position = *transformed_position;
-    } else if (auto containing_block = paintable.containing_block()) {
-        if (auto transformed_position = inverse_transform_point(*containing_block, position); transformed_position.has_value())
-            offset_position = *transformed_position;
-    }
+    if (auto transformed_position = inverse_transform_point(paintable, position); transformed_position.has_value())
+        offset_position = *transformed_position;
 
     auto const top_left_of_layout_node = paintable.box_type_agnostic_position();
     return offset_position - top_left_of_layout_node;
@@ -3546,6 +3118,11 @@ void Document::adopt_node(Node& node)
             old_document.m_node_iterators.remove(&node_iterator);
             m_node_iterators.set(&node_iterator);
         }
+
+        // AD-HOC: A parentless node leaves oldDocument without any mutation observable through oldDocument's
+        //         dom_tree_version. Bump it so that caches keyed on that version can't serve stale results for this
+        //         node if it is later adopted back after being mutated under another document.
+        old_document.bump_dom_tree_version();
     }
 }
 
@@ -4381,8 +3958,10 @@ WebIDL::ExceptionOr<void> Document::set_cookie(StringView cookie_string)
 
     // Otherwise, the user agent must act as it would when receiving a set-cookie-string for the document's URL via a
     // "non-HTTP" API, consisting of the new value encoded as UTF-8.
-    if (auto cookie = HTTP::Cookie::parse_cookie(url(), cookie_string); cookie.has_value())
+    if (auto cookie = HTTP::Cookie::parse_cookie(url(), cookie_string); cookie.has_value()) {
         page().client().page_did_set_cookie(m_url, cookie.value(), HTTP::Cookie::Source::NonHttp);
+        reset_cookie_version();
+    }
 
     return {};
 }
@@ -6135,7 +5714,7 @@ void Document::queue_an_intersection_observer_entry(IntersectionObserver::Inters
 }
 
 // https://www.w3.org/TR/intersection-observer/#compute-the-intersection
-static CSSPixelRect compute_intersection(GC::Ref<Element> target, CSSPixelRect target_rect, IntersectionObserver::IntersectionObserver const& observer, RefPtr<Painting::PaintableBox> root_paintable, CSSPixelRect const& root_bounds)
+static CSSPixelRect compute_intersection(GC::Ref<Element> target, CSSPixelRect target_rect, IntersectionObserver::IntersectionObserver const& observer, RefPtr<Painting::Paintable> root_paintable, CSSPixelRect const& root_bounds)
 {
     // 1. Let intersectionRect be the result of getting the bounding box for target.
     auto intersection_rect = target_rect;
@@ -8476,7 +8055,7 @@ Optional<CSSPixelRect> Document::current_caret_rect()
     // Empty editable elements have no fragments; fall back to the padding-box corner.
     if (auto* node_with_style = as_if<Layout::NodeWithStyleAndBoxModelMetrics>(*layout_node)) {
         auto paintable = node_with_style->first_paintable();
-        if (auto const* box = as_if<Painting::PaintableBox>(paintable.ptr())) {
+        if (auto const* box = paintable.ptr()) {
             auto content_box = box->absolute_padding_box_rect();
             return to_viewport_rect(CSSPixelRect { content_box.x(), content_box.y(), 1, node_with_style->computed_values().line_height() });
         }
@@ -8574,6 +8153,39 @@ void Document::set_needs_accumulated_visual_contexts_update(bool value)
         set_needs_repaint(InvalidateDisplayList::No);
 }
 
+void Document::schedule_accumulated_visual_context_value_update(Layout::Node const& layout_node)
+{
+    // NB: A full rebuild is already pending and will refresh all node values anyway.
+    if (m_needs_accumulated_visual_contexts_update)
+        return;
+
+    // NB: Cap the queue in case it's never consumed (e.g. forced style updates in a document that never paints).
+    static constexpr size_t max_pending_visual_context_value_updates = 1024;
+    if (m_paintable_boxes_needing_visual_context_value_update.size() >= max_pending_visual_context_value_updates) {
+        m_paintable_boxes_needing_visual_context_value_update.clear();
+        set_needs_accumulated_visual_contexts_update(true);
+        return;
+    }
+
+    bool scheduled_any = false;
+    for (auto const& layout_node_paintable : layout_node.paintables()) {
+        m_paintable_boxes_needing_visual_context_value_update.append(*layout_node_paintable);
+        scheduled_any = true;
+    }
+    if (scheduled_any)
+        set_needs_repaint(InvalidateDisplayList::No);
+}
+
+void Document::schedule_accumulated_visual_context_value_update(Element& element)
+{
+    if (auto* layout_node = element.unsafe_layout_node())
+        schedule_accumulated_visual_context_value_update(*layout_node);
+    element.for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement const& pseudo_element) {
+        if (auto* pseudo_element_layout_node = pseudo_element.unsafe_layout_node())
+            schedule_accumulated_visual_context_value_update(*pseudo_element_layout_node);
+    });
+}
+
 void Document::set_needs_to_record_display_list()
 {
     m_hit_test_display_list = nullptr;
@@ -8644,7 +8256,7 @@ RefPtr<Painting::DisplayList> Document::record_display_list(HTML::PaintConfig co
         if (!flexbox_highlight.node)
             continue;
         auto paintable = flexbox_highlight.node->paintable();
-        auto const* paintable_box = as_if<Painting::PaintableBox>(paintable.ptr());
+        auto const* paintable_box = paintable.ptr();
         if (!paintable_box)
             continue;
         paintable_box->paint_flexbox_inspector_overlay(context, flexbox_highlight.options);
@@ -8654,7 +8266,7 @@ RefPtr<Painting::DisplayList> Document::record_display_list(HTML::PaintConfig co
         if (!grid_highlight.node)
             continue;
         auto paintable = grid_highlight.node->paintable();
-        auto const* paintable_box = as_if<Painting::PaintableBox>(paintable.ptr());
+        auto const* paintable_box = paintable.ptr();
         if (!paintable_box)
             continue;
         paintable_box->paint_grid_inspector_overlay(context, grid_highlight.options);
@@ -9125,8 +8737,8 @@ String Document::dump_display_list()
     if (!display_list)
         return "No display list"_string;
 
-    HashMap<size_t, RefPtr<Painting::PaintableBox const>> context_id_to_paintable;
-    viewport_paintable->for_each_in_inclusive_subtree_of_type<Painting::PaintableBox>([&](auto const& paintable_box) {
+    HashMap<size_t, RefPtr<Painting::Paintable const>> context_id_to_paintable;
+    viewport_paintable->for_each_in_inclusive_subtree_of_type<Painting::Paintable>([&](auto const& paintable_box) {
         auto visual_context_index = paintable_box.accumulated_visual_context_index();
         (void)context_id_to_paintable.try_set(visual_context_index.value(), paintable_box);
         return TraversalDecision::Continue;
@@ -9523,7 +9135,7 @@ static bool contains_named_namespace(CSS::SelectorList const& selectors)
     return false;
 }
 
-Optional<CSS::SelectorList> const& Document::parse_or_cache_selector_list(StringView selector_text) const
+RefPtr<SelectorQuery const> Document::selector_query_for(StringView selector_text) const
 {
     static constexpr size_t MAX_SELECTOR_QUERY_CACHE_SIZE = 512;
 
@@ -9538,13 +9150,22 @@ Optional<CSS::SelectorList> const& Document::parse_or_cache_selector_list(String
     if (maybe_selectors.has_value() && contains_named_namespace(maybe_selectors.value()))
         maybe_selectors.clear();
 
+    RefPtr<SelectorQuery const> query;
+    if (maybe_selectors.has_value())
+        query = SelectorQuery::create(maybe_selectors.release_value());
+
     if (m_selector_query_cache.size() >= MAX_SELECTOR_QUERY_CACHE_SIZE)
         m_selector_query_cache.remove(m_selector_query_cache.begin());
 
-    m_selector_query_cache.set(selector_text_string, move(maybe_selectors));
-    auto it = m_selector_query_cache.find(selector_text_string);
-    VERIFY(it != m_selector_query_cache.end());
-    return it->value;
+    m_selector_query_cache.set(selector_text_string, query);
+    return query;
+}
+
+QuerySelectorResultCache& Document::query_selector_result_cache()
+{
+    if (!m_query_selector_result_cache)
+        m_query_selector_result_cache = make<QuerySelectorResultCache>();
+    return *m_query_selector_result_cache;
 }
 
 }

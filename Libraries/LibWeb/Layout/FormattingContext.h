@@ -173,6 +173,7 @@ public:
     [[nodiscard]] CSSPixelRect content_box_rect(LayoutState::UsedValues const&) const;
     [[nodiscard]] CSSPixelRect content_box_rect_in_ancestor_coordinate_space(LayoutState::UsedValues const&, Box const& ancestor_box) const;
     [[nodiscard]] CSSPixels box_baseline(Box const&, BaselineSet) const;
+    void compute_and_store_baselines(LayoutState::UsedValues&) const;
 
     [[nodiscard]] CSSPixels calculate_stretch_fit_width(Box const&, AvailableSize const&) const;
     [[nodiscard]] CSSPixels calculate_stretch_fit_height(Box const&, AvailableSize const&) const;
@@ -195,6 +196,20 @@ protected:
 
     [[nodiscard]] bool box_is_sized_as_replaced_element(Box const&, AvailableSpace const&, ContainingBlockConstraints const&) const;
 
+    enum class CyclicPercentageIntrinsicContribution {
+        NotCyclic,
+        ResolveAsZero,
+        TreatAsInitialValue,
+    };
+    // CSS Sizing resolves cyclic percentages differently for minimum sizes than for preferred/max sizes.
+    // In particular, replaced boxes resolve cyclic preferred/max sizes against zero for min-content
+    // contributions, while cyclic min sizes are treated as their initial value.
+    enum class CyclicPercentageSizeProperty {
+        PreferredOrMaxSize,
+        MinSize,
+    };
+    [[nodiscard]] CyclicPercentageIntrinsicContribution cyclic_percentage_intrinsic_contribution(Box const&, CSS::Size const&, AvailableSize const&, CyclicPercentageSizeProperty) const;
+
     OwnPtr<FormattingContext> layout_inside(Box const&, LayoutMode, LayoutInput const&);
 
     struct SpaceUsedByFloats {
@@ -211,6 +226,9 @@ protected:
     CSSPixels tentative_height_for_replaced_element(Box const&, CSS::Size const& computed_height, AvailableSpace const&, ContainingBlockConstraints const&) const;
     CSSPixels compute_auto_height_for_block_formatting_context_root(Box const&) const;
     static CSSPixels line_box_physical_width(Box const&, LineBox const&);
+
+    CSSPixels measure_automatic_content_height(Box const&, AvailableSpace const& inner_available_space, ContainingBlockConstraints const&);
+    void make_button_content_box_definite(Box const&, AvailableSpace const&, ContainingBlockConstraints const&, Optional<CSSPixels> measured_content_height = {});
 
     [[nodiscard]] CSSPixelSize solve_replaced_size_constraint(CSSPixels input_width, CSSPixels input_height, Box const&, AvailableSpace const&, ContainingBlockConstraints const&) const;
 
@@ -237,8 +255,6 @@ protected:
     void compute_height_for_absolutely_positioned_replaced_element(Box const&, AvailableSpace const&, ContainingBlockConstraints const&, BeforeOrAfterInsideLayout);
 
     [[nodiscard]] Optional<CSSPixels> compute_auto_height_for_absolutely_positioned_element(Box const&, AvailableSpace const&, ContainingBlockConstraints const&, BeforeOrAfterInsideLayout) const;
-
-    [[nodiscard]] Box const* box_child_to_derive_baseline_from(Box const&, BaselineSet) const;
 
     Type m_type {};
     LayoutMode m_layout_mode;

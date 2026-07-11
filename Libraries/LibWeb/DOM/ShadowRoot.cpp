@@ -113,14 +113,10 @@ WebIDL::ExceptionOr<void> ShadowRoot::set_inner_html(TrustedTypes::TrustedHTMLOr
         TrustedTypes::InjectionSink::ShadowRoot_innerHTML,
         TrustedTypes::Script.to_string()));
 
-    // 2. Let context be this's host.
-    auto context = this->host();
-    VERIFY(context);
+    // 2. Let fragment be the result of invoking the fragment parsing algorithm steps with this and compliantString.
+    auto fragment = TRY(HTML::HTMLParser::parse_html_fragment(GC::Ref<DocumentFragment> { *this }, compliant_string.utf16_view()));
 
-    // 3. Let fragment be the result of invoking the fragment parsing algorithm steps with context and compliantString.
-    auto fragment = TRY(context->parse_fragment(compliant_string.to_utf8_but_should_be_ported_to_utf16()));
-
-    // 4. Replace all with fragment within this.
+    // 3. Replace all with fragment within this.
     this->replace_all(fragment);
 
     // NOTE: We don't invalidate style & layout for <template> elements since they don't affect rendering.
@@ -162,7 +158,7 @@ WebIDL::ExceptionOr<void> ShadowRoot::set_html_unsafe(TrustedTypes::TrustedHTMLO
         TrustedTypes::Script.to_string()));
 
     // 2. Unsafely set HTML given this, this's shadow host, and compliantHTML.
-    TRY(unsafely_set_html(*this->host(), compliant_html.to_utf8_but_should_be_ported_to_utf16()));
+    TRY(unsafely_set_html(GC::Ref<DocumentFragment> { *this }, compliant_html.utf16_view()));
 
     return {};
 }
@@ -275,7 +271,7 @@ void ShadowRoot::unregister_slot(HTML::HTMLSlotElement& slot)
         m_slot_registry->remove(slot);
 }
 
-GC::Ptr<HTML::HTMLSlotElement> ShadowRoot::first_slot_with_name(FlyString const& name) const
+GC::Ptr<HTML::HTMLSlotElement> ShadowRoot::first_slot_with_name(Utf16FlyString const& name) const
 {
     if (!m_slot_registry)
         return nullptr;
@@ -297,8 +293,8 @@ ShadowRoot::PartElementMap const& ShadowRoot::part_element_map() const
 // https://drafts.csswg.org/css-shadow-1/#exportparts
 // Parse the exportparts attribute into a list of (inner_name, outer_name) pairs.
 struct ExportedPart {
-    FlyString inner_name;
-    FlyString outer_name;
+    Utf16FlyString inner_name;
+    Utf16FlyString outer_name;
 };
 
 static Vector<ExportedPart> parse_exportparts_attribute(Element const& element)
@@ -308,20 +304,27 @@ static Vector<ExportedPart> parse_exportparts_attribute(Element const& element)
     if (!exportparts.has_value())
         return result;
 
-    exportparts->code_points().for_each_split_view([](u32 c) { return c == ','; }, SplitBehavior::Nothing, [&](Utf8View mapping) {
-        auto trimmed = mapping.as_string().trim_whitespace();
+    exportparts->for_each_split_view(u',', SplitBehavior::Nothing, [&](Utf16View mapping) {
+        auto trimmed = mapping.trim_ascii_whitespace();
         if (trimmed.is_empty())
-            return;
+            return IterationDecision::Continue;
 
-        auto parts = trimmed.split_view(':', SplitBehavior::KeepEmpty);
+        Vector<Utf16View, 2> parts;
+        trimmed.for_each_split_view(u':', SplitBehavior::KeepEmpty, [&](Utf16View part) {
+            parts.append(part);
+            return IterationDecision::Continue;
+        });
         if (parts.size() == 1) {
-            auto name = MUST(FlyString::from_utf8(parts[0].trim_whitespace()));
+            auto name = Utf16FlyString::from_utf16(parts[0].trim_ascii_whitespace());
             result.append({ name, name });
         } else if (parts.size() == 2) {
-            auto inner_name = MUST(FlyString::from_utf8(parts[0].trim_whitespace()));
-            auto outer_name = MUST(FlyString::from_utf8(parts[1].trim_whitespace()));
+            auto inner_name = Utf16FlyString::from_utf16(parts[0].trim_ascii_whitespace());
+            auto outer_name = Utf16FlyString::from_utf16(parts[1].trim_ascii_whitespace());
             result.append({ inner_name, outer_name });
-        } });
+        }
+
+        return IterationDecision::Continue;
+    });
 
     return result;
 }

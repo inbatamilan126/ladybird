@@ -9,11 +9,12 @@
 #include <AK/EnumBits.h>
 #include <AK/String.h>
 #include <AK/Types.h>
+#include <AK/Utf16View.h>
 
 namespace Web::HTML {
 
 // https://html.spec.whatwg.org/multipage/origin.html#sandboxing-flag-set
-enum class SandboxingFlagSet {
+enum class SandboxingFlagSet : u32 {
     SandboxedNavigation = 1u << 0u,
     SandboxedAuxiliaryNavigation = 1u << 1u,
     SandboxedTopLevelNavigationWithoutUserActivation = 1u << 2u,
@@ -36,6 +37,7 @@ enum class SandboxingFlagSet {
 AK_ENUM_BITWISE_OPERATORS(SandboxingFlagSet);
 inline bool is_empty(SandboxingFlagSet s) { return (to_underlying(s) & 0x1FFU) == 0; }
 
-SandboxingFlagSet parse_a_sandboxing_directive(Variant<String, Vector<String>> input);
+SandboxingFlagSet parse_a_sandboxing_directive(Utf16View input);
+SandboxingFlagSet parse_a_sandboxing_directive(Vector<String> const& input);
 
 }

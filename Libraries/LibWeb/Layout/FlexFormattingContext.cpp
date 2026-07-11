@@ -260,6 +260,13 @@ void FlexFormattingContext::run(LayoutInput const& layout_input)
 
         resolve_baseline_aligned_items();
 
+        for (auto& item : m_flex_items) {
+            if (main_axis_is_horizontal())
+                place_child(item.box, { item.main_offset, item.cross_offset });
+            else
+                place_child(item.box, { item.cross_offset, item.main_offset });
+        }
+
         compute_and_store_baselines(m_flex_container_state);
     }
 
@@ -273,9 +280,8 @@ void FlexFormattingContext::parent_context_did_dimension_child_root_box()
         return;
 
     flex_container().for_each_child_of_type<Box>([&](Layout::Box& box) {
-        if (box.is_absolutely_positioned()) {
-            m_state.create(box, {}, {}).set_static_position_rect(calculate_static_position_rect(box));
-        }
+        if (box.is_absolutely_positioned())
+            register_contained_abspos_child(box, calculate_static_position_rect(box));
         return IterationDecision::Continue;
     });
 
@@ -568,14 +574,6 @@ void FlexFormattingContext::set_cross_size(FlexItem& item, CSSPixels size)
         item.used_values.set_content_width(size);
     else
         item.used_values.set_content_height(size);
-}
-
-void FlexFormattingContext::set_offset(FlexItem& item, CSSPixels main_offset, CSSPixels cross_offset)
-{
-    if (main_axis_is_horizontal())
-        item.used_values.set_content_offset({ main_offset, cross_offset });
-    else
-        item.used_values.set_content_offset({ cross_offset, main_offset });
 }
 
 void FlexFormattingContext::set_main_axis_first_margin(FlexItem& item, CSSPixels margin)
@@ -1333,12 +1331,24 @@ void FlexFormattingContext::determine_hypothetical_cross_size_of_item(FlexItem& 
     }
 
     if (item.box.has_preferred_aspect_ratio()) {
+        // AD-HOC: For a replaced box whose only sizing information is a natural aspect ratio (e.g an SVG with a
+        //         viewBox but no natural width or height) and an indefinite flex basis, we stretch-fit the cross size
+        //         to the flex container instead of transferring the used main size through the aspect ratio.
         auto auto_size = item.box.auto_content_box_size();
-        if (item.used_flex_basis_is_definite || (auto_size.has_width() && auto_size.has_height())) {
-            item.hypothetical_cross_size = css_clamp(calculate_cross_size_from_main_size_and_aspect_ratio(item.main_size.value(), item.box.preferred_aspect_ratio().value()), clamp_min, clamp_max);
+        bool is_replaced_box_with_only_natural_aspect_ratio = item.box.is_replaced_box() && !(auto_size.has_width() && auto_size.has_height());
+        if (is_replaced_box_with_only_natural_aspect_ratio && !item.used_flex_basis_is_definite) {
+            item.hypothetical_cross_size = css_clamp(inner_cross_size(m_flex_container_state), clamp_min, clamp_max);
             return;
         }
-        item.hypothetical_cross_size = css_clamp(inner_cross_size(m_flex_container_state), clamp_min, clamp_max);
+
+        // https://drafts.csswg.org/css-sizing-4/#aspect-ratio-automatic
+        // When a box has a preferred aspect ratio, its automatic sizes are calculated the same as for a
+        // replaced element with a natural aspect ratio and no natural size in that axis, see e.g. CSS2 § 10
+        // and CSS Flexible Box Model Level 1 § 9.2. The axis in which the preferred size calculation depends
+        // on this aspect ratio is called the ratio-dependent axis, and the resulting size is definite if its
+        // input sizes are also definite.
+        item.hypothetical_cross_size = css_clamp(calculate_cross_size_from_main_size_and_aspect_ratio(item.main_size.value(), item.box.preferred_aspect_ratio().value()), clamp_min, clamp_max);
+        item.cross_size_was_resolved_from_aspect_ratio = has_definite_main_size(item);
         return;
     }
 
@@ -1431,6 +1441,14 @@ void FlexFormattingContext::determine_used_cross_size_of_each_flex_item()
             } else {
                 // Otherwise, the used cross size is the item’s hypothetical cross size.
                 item.cross_size = item.hypothetical_cross_size;
+
+                // https://drafts.csswg.org/css-sizing-4/#aspect-ratio-automatic
+                // The axis in which the preferred size calculation depends on this aspect ratio is called the
+                // ratio-dependent axis, and the resulting size is definite if its input sizes are also definite.
+                if (item.cross_size_was_resolved_from_aspect_ratio) {
+                    set_cross_size(item, item.cross_size.value());
+                    set_has_definite_cross_size(item);
+                }
             }
         }
     }
@@ -1764,11 +1782,7 @@ void FlexFormattingContext::resolve_baseline_aligned_items()
             if (!participates_in_baseline_alignment(item))
                 continue;
 
-            auto adjustment = max_baseline - box_baseline(item.box, BaselineSet::First);
-            if (main_axis_is_horizontal())
-                item.used_values.set_content_y(item.used_values.offset.y() + adjustment);
-            else
-                item.used_values.set_content_x(item.used_values.offset.x() + adjustment);
+            item.cross_offset += max_baseline - box_baseline(item.box, BaselineSet::First);
         }
     }
 }
@@ -1944,7 +1958,6 @@ void FlexFormattingContext::copy_dimensions_from_flex_items_to_boxes()
 
         set_main_size(item, item.main_size.value());
         set_cross_size(item, item.cross_size.value());
-        set_offset(item, item.main_offset, item.cross_offset);
     }
 }
 

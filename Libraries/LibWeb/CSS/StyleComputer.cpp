@@ -110,7 +110,7 @@ static void for_each_element_hash(DOM::Element const& element, auto callback)
 {
     callback(ancestor_filter_hash_for_tag_name(element.local_name().ascii_case_insensitive_hash()));
     if (element.id().has_value())
-        callback(ancestor_filter_hash_for_id(element.id().value().hash()));
+        callback(ancestor_filter_hash_for_id(element.id()->hash()));
     for (auto const& class_ : element.class_names())
         callback(ancestor_filter_hash_for_class(class_.hash()));
     element.for_each_attribute([&](auto& attribute) {
@@ -222,11 +222,13 @@ RuleCache const* StyleComputer::rule_cache_for_cascade_origin(CascadeOrigin casc
     return rule_caches_by_layer->by_layer.get(*qualified_layer_name).value_or(nullptr);
 }
 
-[[nodiscard]] static bool filter_namespace_rule(Optional<FlyString> const& element_namespace_uri, MatchingRule const& rule)
+[[nodiscard]] static bool filter_namespace_rule(Optional<Utf16FlyString> const& element_namespace_uri, MatchingRule const& rule)
 {
     // FIXME: Filter out non-default namespace using prefixes
-    if (rule.default_namespace.has_value() && element_namespace_uri != rule.default_namespace)
-        return false;
+    if (rule.default_namespace.has_value()) {
+        if (!element_namespace_uri.has_value() || element_namespace_uri->view() != rule.default_namespace->view())
+            return false;
+    }
     return true;
 }
 
@@ -260,9 +262,9 @@ Vector<HasInvalidationMetadata> const* StyleComputer::has_invalidation_metadata_
 
     switch (property.type) {
     case InvalidationSet::Property::Type::Id:
-        return return_bucket_if_present(style_invalidation_data.ids_used_in_has_selectors, property.name());
+        return return_bucket_if_present(style_invalidation_data.ids_used_in_has_selectors, property.id());
     case InvalidationSet::Property::Type::Class:
-        return return_bucket_if_present(style_invalidation_data.class_names_used_in_has_selectors, property.name());
+        return return_bucket_if_present(style_invalidation_data.class_names_used_in_has_selectors, property.class_name());
     case InvalidationSet::Property::Type::Attribute:
         return return_bucket_if_present(style_invalidation_data.attribute_names_used_in_has_selectors, property.name());
     case InvalidationSet::Property::Type::TagName:
@@ -445,10 +447,10 @@ struct ParentFilterHashCollector {
         Vector<u32> hashes;
         switch (simple_selector.type) {
         case Selector::SimpleSelector::Type::Id:
-            hashes.append(ancestor_filter_hash_for_id(simple_selector.name().hash()));
+            hashes.append(ancestor_filter_hash_for_id(simple_selector.id_name().hash()));
             break;
         case Selector::SimpleSelector::Type::Class:
-            hashes.append(ancestor_filter_hash_for_class(simple_selector.name().hash()));
+            hashes.append(ancestor_filter_hash_for_class(simple_selector.class_name().hash()));
             break;
         case Selector::SimpleSelector::Type::TagName:
             hashes.append(ancestor_filter_hash_for_tag_name(simple_selector.qualified_name().name.lowercase_name.hash()));
@@ -1060,58 +1062,58 @@ void StyleComputer::collect_animation_into(DOM::AbstractElement abstract_element
         return;
     }
 
-    double progress = round(output_progress.value() * 100.0 * Animations::KeyframeEffect::AnimationKeyFrameKeyScaleFactor);
-    // FIXME: Support progress values outside the range of i64.
-    i64 key = 0;
-    if (progress > NumericLimits<i64>::max()) {
-        key = NumericLimits<i64>::max();
-    } else if (progress < NumericLimits<i64>::min()) {
-        key = NumericLimits<i64>::min();
-    } else {
-        key = static_cast<i64>(progress);
+    double current_key = output_progress.value() * 100.0 * Animations::KeyframeEffect::AnimationKeyFrameKeyScaleFactor;
+    current_key = clamp(current_key, static_cast<double>(NumericLimits<i64>::min()), static_cast<double>(NumericLimits<i64>::max()));
+
+    // Each property is animated using its property-specific keyframes, so two properties in the same animation may be
+    // interpolated across different intervals.
+    // Collect the keyframes in ascending offset order, and index for each physical longhand the keyframes that specify
+    // it, so that the interval endpoints can be found separately for every property.
+    LogicalAliasMappingContext const logical_alias_mapping_context { computed_properties.writing_mode(), computed_properties.direction() };
+    struct KeyframeInfo {
+        i64 key { 0 };
+        Animations::KeyframeEffect::KeyFrameSet::ResolvedKeyFrame const* frame { nullptr };
+    };
+    Vector<KeyframeInfo> ordered_keyframes;
+    ordered_keyframes.ensure_capacity(keyframes.size());
+    HashMap<PropertyID, Vector<size_t>> keyframes_specifying_property;
+    for (auto it = keyframes.begin(); it != keyframes.end(); ++it) {
+        auto keyframe_index = ordered_keyframes.size();
+        auto add_physical_longhand = [&](PropertyID longhand_id) {
+            auto physical_longhand_id = map_logical_alias_to_physical_property(longhand_id, logical_alias_mapping_context);
+            auto& specifying_keyframes = keyframes_specifying_property.ensure(physical_longhand_id);
+            if (specifying_keyframes.is_empty() || specifying_keyframes.last() != keyframe_index)
+                specifying_keyframes.append(keyframe_index);
+        };
+        for (auto const& [property_id, value] : it->properties) {
+            value.visit(
+                [&](Animations::KeyframeEffect::KeyFrameSet::UseInitial) { add_physical_longhand(property_id); },
+                [&](NonnullRefPtr<StyleValue const> const& keyframe_value) {
+                    for_each_property_expanding_shorthands(property_id, *keyframe_value, [&](PropertyID longhand_id, StyleValue const&) {
+                        add_physical_longhand(longhand_id);
+                    });
+                });
+        }
+        ordered_keyframes.append({ static_cast<i64>(it.key()), &*it });
     }
-    auto keyframe_start_it = [&] {
-        if (output_progress.value() <= 0) {
-            return keyframes.begin();
-        }
-        auto potential_match = keyframes.find_largest_not_above_iterator(key);
-        auto next = potential_match;
-        ++next;
-        if (next.is_end()) {
-            --potential_match;
-        }
-        return potential_match;
-    }();
-    auto keyframe_start = static_cast<i64>(keyframe_start_it.key());
-    auto keyframe_values = *keyframe_start_it;
-
-    auto keyframe_end_it = ++keyframe_start_it;
-    VERIFY(!keyframe_end_it.is_end());
-    auto keyframe_end = static_cast<i64>(keyframe_end_it.key());
-    auto keyframe_end_values = *keyframe_end_it;
-
-    auto progress_in_keyframe = (progress - keyframe_start) / static_cast<double>(keyframe_end - keyframe_start);
 
     // https://drafts.csswg.org/css-animations-1/#animation-timing-function
     // Apply the per-keyframe easing to the interval progress. The easing on a keyframe applies to the
     // interval from that keyframe to the next. If the keyframe doesn't specify an easing, use the
     // animation's default easing (from the animation-timing-function property).
-    auto resolved_easing = keyframe_values.easing.visit(
-        [](Empty) -> Optional<CSS::EasingFunction> { return {}; },
-        [](CSS::EasingFunction const& easing) -> Optional<CSS::EasingFunction> { return easing; },
-        [&](NonnullRefPtr<CSS::StyleValue const> const& value) -> Optional<CSS::EasingFunction> {
-            return resolve_keyframe_easing(*value, abstract_element);
-        });
-    if (resolved_easing.has_value()) {
-        progress_in_keyframe = resolved_easing->evaluate_at(progress_in_keyframe, false);
-    } else if (animation->is_css_animation()) {
-        progress_in_keyframe = static_cast<CSSAnimation const&>(*animation).default_easing().evaluate_at(progress_in_keyframe, false);
-    }
-
-    if constexpr (LIBWEB_CSS_ANIMATION_DEBUG) {
-        auto valid_properties = keyframe_values.properties.size();
-        dbgln("Animation {} contains {} properties to interpolate, progress = {}%", animation->id(), valid_properties, progress_in_keyframe * 100);
-    }
+    auto apply_keyframe_easing = [&](auto const& keyframe_easing, double interval_progress) {
+        auto resolved_easing = keyframe_easing.visit(
+            [](Empty) -> Optional<CSS::EasingFunction> { return {}; },
+            [](CSS::EasingFunction const& easing) -> Optional<CSS::EasingFunction> { return easing; },
+            [&](NonnullRefPtr<CSS::StyleValue const> const& value) -> Optional<CSS::EasingFunction> {
+                return resolve_keyframe_easing(*value, abstract_element);
+            });
+        if (resolved_easing.has_value())
+            return resolved_easing->evaluate_at(interval_progress, false);
+        if (animation->is_css_animation())
+            return static_cast<CSSAnimation const&>(*animation).default_easing().evaluate_at(interval_progress, false);
+        return interval_progress;
+    };
 
     // FIXME: Follow https://drafts.csswg.org/web-animations-1/#ref-for-computed-keyframes in whatever the right place is.
     auto compute_keyframe_values = [&computed_properties, &abstract_element, builder, this](auto const& keyframe_values) {
@@ -1261,10 +1263,6 @@ void StyleComputer::collect_animation_into(DOM::AbstractElement abstract_element
         return result;
     };
 
-    VERIFY(computation_context_cache_is_empty());
-    HashMap<PropertyID, RefPtr<StyleValue const>> computed_start_values = compute_keyframe_values(keyframe_values);
-    HashMap<PropertyID, RefPtr<StyleValue const>> computed_end_values = compute_keyframe_values(keyframe_end_values);
-    clear_computation_context_caches();
     auto to_composite_operation = [&](Bindings::CompositeOperationOrAuto composite_operation_or_auto) {
         switch (composite_operation_or_auto) {
         case Bindings::CompositeOperationOrAuto::Accumulate:
@@ -1281,23 +1279,49 @@ void StyleComputer::collect_animation_into(DOM::AbstractElement abstract_element
 
     auto is_result_of_transition = animation->is_css_transition() ? AnimatedPropertyResultOfTransition::Yes : AnimatedPropertyResultOfTransition::No;
 
-    auto start_composite_operation = to_composite_operation(keyframe_values.composite);
-    auto end_composite_operation = to_composite_operation(keyframe_end_values.composite);
+    Vector<HashMap<PropertyID, RefPtr<StyleValue const>>> keyframe_computed_values;
+    keyframe_computed_values.resize(ordered_keyframes.size());
+    auto computed_values_for_keyframe = [&](size_t index) -> HashMap<PropertyID, RefPtr<StyleValue const>> const& {
+        if (keyframe_computed_values[index].is_empty())
+            keyframe_computed_values[index] = compute_keyframe_values(*ordered_keyframes[index].frame);
+        return keyframe_computed_values[index];
+    };
 
-    for (auto const& it : computed_start_values) {
-        auto resolved_start_property = it.value;
-        RefPtr resolved_end_property = computed_end_values.get(it.key).value_or(nullptr);
+    VERIFY(computation_context_cache_is_empty());
+
+    for (auto const& [property_id, specifying_keyframes] : keyframes_specifying_property) {
+        // A property is usually specified by at least the initial and final keyframes, but a value that stays
+        // unresolved may leave a property with only one specifying keyframe. Such a property cannot be interpolated, so skip it.
+        if (specifying_keyframes.size() < 2)
+            continue;
+
+        auto start_keyframe = specifying_keyframes[0];
+        auto end_keyframe = specifying_keyframes[1];
+        for (size_t next = 2; next < specifying_keyframes.size(); ++next) {
+            if (current_key < ordered_keyframes[end_keyframe].key)
+                break;
+            start_keyframe = end_keyframe;
+            end_keyframe = specifying_keyframes[next];
+        }
+
+        auto start_key = ordered_keyframes[start_keyframe].key;
+        auto end_key = ordered_keyframes[end_keyframe].key;
+        double interval_progress = (static_cast<double>(current_key) - start_key) / static_cast<double>(end_key - start_key);
+        interval_progress = apply_keyframe_easing(ordered_keyframes[start_keyframe].frame->easing, interval_progress);
+
+        RefPtr<StyleValue const> resolved_start_property = computed_values_for_keyframe(start_keyframe).get(property_id).value_or(nullptr);
+        RefPtr<StyleValue const> resolved_end_property = computed_values_for_keyframe(end_keyframe).get(property_id).value_or(nullptr);
 
         if (!resolved_end_property) {
             if (resolved_start_property) {
-                computed_properties.set_animated_property(Badge<StyleComputer> {}, it.key, *resolved_start_property, is_result_of_transition);
-                dbgln_if(LIBWEB_CSS_ANIMATION_DEBUG, "No end property for property {}, using {}", string_from_property_id(it.key), resolved_start_property->to_string(SerializationMode::Normal));
+                computed_properties.set_animated_property(Badge<StyleComputer> {}, property_id, *resolved_start_property, is_result_of_transition);
+                dbgln_if(LIBWEB_CSS_ANIMATION_DEBUG, "No end property for property {}, using {}", string_from_property_id(property_id), resolved_start_property->to_string(SerializationMode::Normal));
             }
             continue;
         }
 
         if (resolved_end_property && !resolved_start_property)
-            resolved_start_property = property_initial_value(it.key);
+            resolved_start_property = property_initial_value(property_id);
 
         if (!resolved_start_property || !resolved_end_property)
             continue;
@@ -1307,26 +1331,28 @@ void StyleComputer::collect_animation_into(DOM::AbstractElement abstract_element
 
         // OPTIMIZATION: Values resulting from animations other than CSS transitions are overridden by important
         //               properties so there's no need to calculate them
-        if (!animation->is_css_transition() && computed_properties.is_property_important(it.key)) {
+        if (!animation->is_css_transition() && computed_properties.is_property_important(property_id)) {
             continue;
         }
 
-        auto const& underlying_value = computed_properties.property(it.key);
-        if (auto composited_start_value = composite_value(it.key, underlying_value, start, start_composite_operation))
+        auto const& underlying_value = computed_properties.property(property_id);
+        if (auto composited_start_value = composite_value(property_id, underlying_value, start, to_composite_operation(ordered_keyframes[start_keyframe].frame->composite)))
             start = *composited_start_value;
 
-        if (auto composited_end_value = composite_value(it.key, underlying_value, end, end_composite_operation))
+        if (auto composited_end_value = composite_value(property_id, underlying_value, end, to_composite_operation(ordered_keyframes[end_keyframe].frame->composite)))
             end = *composited_end_value;
 
-        if (auto next_value = interpolate_property(*effect->target(), it.key, *start, *end, progress_in_keyframe, AllowDiscrete::Yes)) {
-            dbgln_if(LIBWEB_CSS_ANIMATION_DEBUG, "Interpolated value for property {} at {}: {} -> {} = {}", string_from_property_id(it.key), progress_in_keyframe, start->to_string(SerializationMode::Normal), end->to_string(SerializationMode::Normal), next_value->to_string(SerializationMode::Normal));
-            computed_properties.set_animated_property(Badge<StyleComputer> {}, it.key, *next_value, is_result_of_transition);
+        if (auto next_value = interpolate_property(*effect->target(), property_id, *start, *end, interval_progress, AllowDiscrete::Yes)) {
+            dbgln_if(LIBWEB_CSS_ANIMATION_DEBUG, "Interpolated value for property {} at {}: {} -> {} = {}", string_from_property_id(property_id), interval_progress, start->to_string(SerializationMode::Normal), end->to_string(SerializationMode::Normal), next_value->to_string(SerializationMode::Normal));
+            computed_properties.set_animated_property(Badge<StyleComputer> {}, property_id, *next_value, is_result_of_transition);
         } else {
             // If interpolate_property() fails, the element should not be rendered
-            dbgln_if(LIBWEB_CSS_ANIMATION_DEBUG, "Interpolated value for property {} at {}: {} -> {} is invalid", string_from_property_id(it.key), progress_in_keyframe, start->to_string(SerializationMode::Normal), end->to_string(SerializationMode::Normal));
+            dbgln_if(LIBWEB_CSS_ANIMATION_DEBUG, "Interpolated value for property {} at {}: {} -> {} is invalid", string_from_property_id(property_id), interval_progress, start->to_string(SerializationMode::Normal), end->to_string(SerializationMode::Normal));
             computed_properties.set_animated_property(Badge<StyleComputer> {}, PropertyID::Visibility, KeywordStyleValue::create(Keyword::Hidden), is_result_of_transition);
         }
     }
+
+    clear_computation_context_caches();
 }
 
 void StyleComputer::process_animation_definitions(ComputedProperties const& computed_properties, CascadedProperties const& cascaded_properties, DOM::AbstractElement& abstract_element) const
@@ -1341,14 +1367,41 @@ void StyleComputer::process_animation_definitions(ComputedProperties const& comp
     if (!element_animations)
         return;
 
-    HashTable<FlyString> defined_animation_names;
+    // https://drafts.csswg.org/css-animations-1/#animations
+    // Setting the 'display' property to 'none' will terminate any running animation applied to the element and its
+    // descendants. If an element has a 'display' of 'none', updating 'display' to a value other than 'none' will
+    // start all animations applied to the element by the 'animation-name' property, as well as all animations
+    // applied to descendants with 'display' other than 'none'.
+    // NB: We must not start animations on elements that are not rendered due to display:none. Once display becomes
+    //     something other than none, the resulting style recomputation re-enters this function and starts them.
+    //     Termination of running animations when display becomes none is handled by
+    //     Element::play_or_cancel_animations_after_display_property_change().
+    // OPTIMIZATION: This involves an ancestor walk, so it's computed lazily since it's only needed on the path that
+    //               starts a brand new animation, not for the common case of an element without animations.
+    Optional<bool> in_display_none_subtree;
+    auto is_in_display_none_subtree = [&] {
+        if (!in_display_none_subtree.has_value()) {
+            bool result = computed_properties.display().is_none();
+            if (!result) {
+                if (abstract_element.pseudo_element().has_value())
+                    result = abstract_element.element().has_inclusive_ancestor_with_display_none_ignoring_animations();
+                else if (auto* parent = abstract_element.element().parent_or_shadow_host())
+                    result = parent->has_inclusive_ancestor_with_display_none_ignoring_animations();
+            }
+            in_display_none_subtree = result;
+        }
+        return in_display_none_subtree.value();
+    };
+
+    HashTable<Utf16FlyString> defined_animation_names;
 
     for (auto const& animation_properties : animation_definitions) {
-        defined_animation_names.set(animation_properties.name);
+        auto const& animation_name = animation_properties.name;
+        defined_animation_names.set(animation_name);
 
         auto find_keyframes = [&](GC::Ptr<DOM::ShadowRoot const> shadow_root) -> RefPtr<Animations::KeyframeEffect::KeyFrameSet const> {
             if (auto const* rule_cache = rule_cache_for_cascade_origin(CascadeOrigin::Author, {}, shadow_root)) {
-                if (auto keyframe_set = rule_cache->rules_by_animation_keyframes.get(animation_properties.name); keyframe_set.has_value())
+                if (auto keyframe_set = rule_cache->rules_by_animation_keyframes.get(animation_name); keyframe_set.has_value())
                     return keyframe_set.value();
             }
             return {};
@@ -1376,8 +1429,11 @@ void StyleComputer::process_animation_definitions(ComputedProperties const& comp
         if (auto const& existing_animation = element_animations->get(animation_properties.name); existing_animation.has_value()) {
             as<Animations::KeyframeEffect>(*existing_animation.value()->effect()).set_key_frame_set(resolve_keyframes());
             existing_animation.value()->apply_css_properties(animation_properties);
-            return;
+            continue;
         }
+
+        if (is_in_display_none_subtree())
+            continue;
 
         // An animation applies to an element if its name appears as one of the identifiers in the computed value of the
         // animation-name property and the animation uses a valid @keyframes rule
@@ -1407,7 +1463,7 @@ void StyleComputer::process_animation_definitions(ComputedProperties const& comp
     }
 }
 
-static void collect_dimension_attribute(Vector<StyleProperty>& properties, DOM::Element const& element, FlyString const& attribute_name, CSS::PropertyID property_id)
+static void collect_dimension_attribute(Vector<StyleProperty>& properties, DOM::Element const& element, Utf16FlyString const& attribute_name, CSS::PropertyID property_id)
 {
     auto attribute = element.attribute(attribute_name);
     if (!attribute.has_value())
@@ -1862,13 +1918,13 @@ static JsonArray serialize_devtools_style_declarations(DOM::Document const& docu
 
     for (auto const& declaration : declarations) {
         bool inherits = declaration.is_custom_property
-            ? custom_property_inherits(document, Utf16FlyString::from_utf8(declaration.name))
-            : PropertyNameAndID::from_name(Utf16FlyString::from_utf8(declaration.name))
+            ? custom_property_inherits(document, declaration.name)
+            : PropertyNameAndID::from_name(declaration.name)
                   .map([](auto const& property) { return !property.is_custom_property() && is_inherited_property(property.id()); })
                   .value_or(false);
 
         serialized_declarations.must_append(serialize_devtools_style_declaration(
-            declaration.name.to_string(),
+            MUST(declaration.name.view().to_utf8()),
             declaration.value,
             declaration.important,
             declaration.is_custom_property ? IsCustomProperty::Yes : IsCustomProperty::No,
@@ -1881,6 +1937,11 @@ static JsonArray serialize_devtools_style_declarations(DOM::Document const& docu
 }
 
 static Vector<Parser::DevToolsStyleDeclaration> parse_devtools_style_declarations(DOM::Document const& document, StringView declaration_block)
+{
+    return Parser::parse_css_declaration_block_for_devtools(Parser::ParsingParams(document), declaration_block);
+}
+
+static Vector<Parser::DevToolsStyleDeclaration> parse_devtools_style_declarations(DOM::Document const& document, Utf16View declaration_block)
 {
     return Parser::parse_css_declaration_block_for_devtools(Parser::ParsingParams(document), declaration_block);
 }
@@ -1931,7 +1992,7 @@ static Optional<String> extract_css_declaration_block_from_source(CSSRule const&
     if (!source_text.has_value())
         return {};
 
-    auto const& source = *source_text;
+    auto source = source_text->to_utf8();
     auto source_view = source.bytes_as_string_view();
     auto const& source_location = rule.source_location();
     if (!source_location.has_value())
@@ -2110,8 +2171,9 @@ static JsonObject serialize_devtools_inline_style(DOM::Document const& document,
     serialized_rule.set("className"sv, 100);
     serialized_rule.set("cssText"sv, declaration.serialized());
     if (authored_text.has_value()) {
-        serialized_rule.set("authoredText"sv, *authored_text);
-        serialized_rule.set("declarations"sv, serialize_devtools_style_declarations(document, parse_devtools_style_declarations(document, authored_text->bytes_as_string_view())));
+        auto authored_text_utf8 = authored_text->to_utf8();
+        serialized_rule.set("authoredText"sv, authored_text_utf8);
+        serialized_rule.set("declarations"sv, serialize_devtools_style_declarations(document, parse_devtools_style_declarations(document, authored_text->utf16_view())));
     } else {
         serialized_rule.set("authoredText"sv, declaration.serialized());
         serialized_rule.set("declarations"sv, serialize_devtools_style_declarations(document, declaration));
@@ -3270,19 +3332,36 @@ NonnullRefPtr<ComputedProperties> StyleComputer::compute_properties(DOM::Abstrac
     if (!abstract_element.pseudo_element().has_value())
         abstract_element.element().adjust_computed_style(builder);
 
+    bool parent_style_in_display_none_subtree = false;
+    if (auto parent = abstract_element.element_to_inherit_style_from(); parent.has_value()) {
+        if (auto parent_style = parent->computed_properties())
+            parent_style_in_display_none_subtree = parent_style->in_display_none_subtree();
+    }
+
     // Transition declarations [css-transitions-1]
     // Theoretically this should be part of the cascade, but it works with computed values, which we don't have until now.
     compute_transitioned_properties(computed_style, abstract_element);
     if (auto previous_style = abstract_element.computed_properties()) {
-        start_needed_transitions(*previous_style, builder, abstract_element);
+        // https://drafts.csswg.org/css-transitions-2/#defining-before-change-style
+        // In Level 1 of this specification, transitions can only start during a style change event for elements which
+        // have a defined before-change style established by the previous style change event. That means a transition
+        // could not be started on an element that was not being rendered for the previous style change event.
+        // FIXME: If an element does not have a before-change style for a given style change event, the starting style
+        //        is used instead of the before-change style to compare with the after-change style to start
+        //        transitions.
+        if (!previous_style->in_display_none_subtree() && !parent_style_in_display_none_subtree)
+            start_needed_transitions(*previous_style, builder, abstract_element);
     }
+
+    if (parent_style_in_display_none_subtree || builder.display().is_none())
+        builder.set_in_display_none_subtree();
 
     return CSS::ComputedProperties::create(move(builder));
 }
 
 struct SimplifiedSelectorForBucketing {
     CSS::Selector::SimpleSelector::Type type;
-    FlyString name;
+    Utf16FlyString name;
 };
 
 static Optional<SimplifiedSelectorForBucketing> bucket_for_is_or_where_selector(CSS::Selector::SimpleSelector const&);
@@ -3397,18 +3476,20 @@ static Optional<SimplifiedSelectorForBucketing> bucket_for_compound_selector(CSS
 {
     Optional<SimplifiedSelectorForBucketing> attribute_bucket;
     for (auto const& simple_selector : compound_selector.simple_selectors.in_reverse()) {
-        if (simple_selector.type == CSS::Selector::SimpleSelector::Type::Class
-            || simple_selector.type == CSS::Selector::SimpleSelector::Type::Id) {
-            return SimplifiedSelectorForBucketing { simple_selector.type, simple_selector.name() };
+        if (simple_selector.type == CSS::Selector::SimpleSelector::Type::Id) {
+            return SimplifiedSelectorForBucketing { .type = simple_selector.type, .name = simple_selector.id_name() };
+        }
+        if (simple_selector.type == CSS::Selector::SimpleSelector::Type::Class) {
+            return SimplifiedSelectorForBucketing { .type = simple_selector.type, .name = simple_selector.class_name() };
         }
 
         if (simple_selector.type == CSS::Selector::SimpleSelector::Type::TagName) {
-            return SimplifiedSelectorForBucketing { simple_selector.type, simple_selector.qualified_name().name.lowercase_name };
+            return SimplifiedSelectorForBucketing { .type = simple_selector.type, .name = simple_selector.qualified_name().name.lowercase_name };
         }
 
         if (simple_selector.type == CSS::Selector::SimpleSelector::Type::Attribute) {
             if (!attribute_bucket.has_value())
-                attribute_bucket = SimplifiedSelectorForBucketing { simple_selector.type, simple_selector.attribute().qualified_name.name.lowercase_name };
+                attribute_bucket = SimplifiedSelectorForBucketing { .type = simple_selector.type, .name = simple_selector.attribute().qualified_name.name.lowercase_name };
             continue;
         }
 
@@ -3445,7 +3526,7 @@ static Optional<SimplifiedSelectorForBucketing> bucket_for_is_or_where_selector(
             common_bucket = bucket.release_value();
             continue;
         }
-        if (common_bucket->type != bucket->type || common_bucket->name != bucket->name)
+        if (!simplified_selectors_for_bucketing_are_equal(*common_bucket, *bucket))
             return {};
     }
     return common_bucket;
@@ -3621,6 +3702,16 @@ static NonnullRefPtr<StyleValue const> compute_value_of_custom_property_impl(DOM
         auto parsing_params = Parser::ParsingParams { document };
         parsing_params.computed_style_for_custom_property_resolution = computed_style_for_custom_property_resolution;
         resolved_value = Parser::Parser::resolve_unresolved_style_value(parsing_params, abstract_element, PropertyNameAndID::from_name(name).release_value(), unresolved, guarded_contexts);
+
+        // A CSS-wide keyword produced by substitution takes on that keyword's meaning for the custom property,
+        // exactly as a literally-specified one would (handled above before substitution).
+        if (resolved_value->is_initial())
+            return document.custom_property_initial_value(name);
+        if (resolved_value->is_inherit())
+            return compute_inherited_custom_property_value(abstract_element, name, guarded_contexts);
+        if (resolved_value->is_unset())
+            return registration.has_value() && !registration->inherit ? document.custom_property_initial_value(name) : compute_inherited_custom_property_value(abstract_element, name, guarded_contexts);
+        // FIXME: Implement reverting custom properties for is_revert() / is_revert_layer().
     }
 
     auto invalid_custom_property_fallback_value = [&](NonnullRefPtr<StyleValue const> invalid_value) {
@@ -3928,7 +4019,7 @@ NonnullRefPtr<StyleValue const> StyleComputer::compute_font_feature_tag_value_li
         return absolutized_value;
 
     auto const& value_list = absolutized_value->as_value_list();
-    OrderedHashMap<FlyString, NonnullRefPtr<OpenTypeTaggedStyleValue const>> axis_tags_map;
+    OrderedHashMap<Utf16FlyString, NonnullRefPtr<OpenTypeTaggedStyleValue const>> axis_tags_map;
     for (size_t i = 0; i < value_list.values().size(); i++) {
         auto const& axis_tag = value_list.values().at(i)->as_open_type_tagged();
         axis_tags_map.set(axis_tag.tag(), axis_tag);
@@ -4443,19 +4534,19 @@ static void add_rule_to_rule_buckets(RuleBuckets& rule_buckets, MatchingRule con
 {
     // NOTE: We traverse the simple selectors in reverse order to make sure that class/ID buckets are preferred over tag buckets
     //       in the common case of div.foo or div#foo selectors.
-    auto add_to_id_bucket = [&](FlyString const& name) {
+    auto add_to_id_bucket = [&](Utf16FlyString const& name) {
         rule_buckets.rules_by_id.ensure(name).append(matching_rule);
     };
 
-    auto add_to_class_bucket = [&](FlyString const& name) {
+    auto add_to_class_bucket = [&](Utf16FlyString const& name) {
         rule_buckets.rules_by_class.ensure(name).append(matching_rule);
     };
 
-    auto add_to_tag_name_bucket = [&](FlyString const& name) {
+    auto add_to_tag_name_bucket = [&](Utf16FlyString const& name) {
         rule_buckets.rules_by_tag_name.ensure(name).append(matching_rule);
     };
 
-    auto add_to_attribute_bucket = [&](FlyString const& name) {
+    auto add_to_attribute_bucket = [&](Utf16FlyString const& name) {
         rule_buckets.rules_by_attribute_name.ensure(name).append(matching_rule);
     };
 
@@ -4473,11 +4564,11 @@ static void add_rule_to_rule_buckets(RuleBuckets& rule_buckets, MatchingRule con
 
     for (auto const& simple_selector : bucket_compound_selector.simple_selectors.in_reverse()) {
         if (simple_selector.type == Selector::SimpleSelector::Type::Id) {
-            add_to_id_bucket(simple_selector.name());
+            add_to_id_bucket(simple_selector.id_name());
             return;
         }
         if (simple_selector.type == Selector::SimpleSelector::Type::Class) {
-            add_to_class_bucket(simple_selector.name());
+            add_to_class_bucket(simple_selector.class_name());
             return;
         }
         if (simple_selector.type == Selector::SimpleSelector::Type::TagName) {
@@ -4554,7 +4645,8 @@ static IterationDecision for_each_matching_rule_bucket(DOM::AbstractElement abst
                 return IterationDecision::Break;
         }
     }
-    if (auto it = rule_buckets.rules_by_tag_name.find(abstract_element.element().lowercased_local_name()); it != rule_buckets.rules_by_tag_name.end()) {
+    auto lowercased_local_name = abstract_element.element().lowercased_local_name();
+    if (auto it = rule_buckets.rules_by_tag_name.find(lowercased_local_name); it != rule_buckets.rules_by_tag_name.end()) {
         if (callback(it->value) == IterationDecision::Break)
             return IterationDecision::Break;
     }
@@ -4565,7 +4657,7 @@ static IterationDecision for_each_matching_rule_bucket(DOM::AbstractElement abst
     }
 
     IterationDecision decision = IterationDecision::Continue;
-    abstract_element.element().for_each_attribute([&](auto& name, auto&) {
+    abstract_element.element().for_each_attribute([&](Utf16FlyString const& name, auto const&) {
         if (auto it = rule_buckets.rules_by_attribute_name.find(name); it != rule_buckets.rules_by_attribute_name.end()) {
             decision = callback(it->value);
         }

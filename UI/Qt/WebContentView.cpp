@@ -38,6 +38,7 @@
 #include <QCursor>
 #include <QGuiApplication>
 #include <QIcon>
+#include <QInputDevice>
 #include <QKeySequence>
 #include <QMimeData>
 #include <QMouseEvent>
@@ -47,12 +48,11 @@
 #include <QPalette>
 #include <QPixmap>
 #include <QScrollBar>
-#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
-#    include <QStyleHints>
-#endif
+#include <QStyleHints>
 #include <QTextEdit>
 #include <QTimer>
 #include <QToolTip>
+#include <QWheelEvent>
 
 namespace Ladybird {
 
@@ -69,6 +69,7 @@ static QWidget* initial_web_content_view_parent([[maybe_unused]] QWidget* window
 
 WebContentView::WebContentView(QWidget* window, RefPtr<WebView::WebContentClient> parent_client, size_t page_index, WebContentViewInitialState initial_state)
     : WebContentViewBase(initial_web_content_view_parent(window))
+    , WebView::ViewImplementation(initial_state.is_private)
 {
 #ifdef LADYBIRD_QT_USE_METAL_RHI_WIDGET
     // Keep the QRhiWidget out of the top-level QWidget backing store. If it is
@@ -94,7 +95,6 @@ WebContentView::WebContentView(QWidget* window, RefPtr<WebView::WebContentClient
 #endif
 
     m_device_pixel_ratio = devicePixelRatio();
-    m_is_private = initial_state.is_private;
     m_maximum_frames_per_second = initial_state.maximum_frames_per_second;
     m_display_id = initial_state.display_id;
 
@@ -108,14 +108,12 @@ WebContentView::WebContentView(QWidget* window, RefPtr<WebView::WebContentClient
         update_screen_rects();
     });
 
-#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
     QObject::connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged, this, [this] {
         QTimer::singleShot(0, this, [this] {
             update_palette();
             schedule_repaint();
         });
     });
-#endif
 
     m_tooltip_hover_timer.setSingleShot(true);
 
@@ -136,6 +134,12 @@ WebContentView::WebContentView(QWidget* window, RefPtr<WebView::WebContentClient
     on_cursor_change = [this](auto cursor) {
         update_cursor(cursor);
     };
+
+#ifdef AK_OS_MACOS
+    on_request_dictionary_lookup = [this](auto const& lookup, auto position) {
+        show_appkit_dictionary_lookup(*this, lookup, position);
+    };
+#endif
 
     on_request_tooltip_override = [this](auto position, auto const& tooltip) {
         m_tooltip_override = true;
@@ -184,7 +188,7 @@ WebContentView::WebContentView(QWidget* window, RefPtr<WebView::WebContentClient
         m_select_dropdown->setMinimumWidth(minimum_width);
 
         auto add_menu_item = [this](Web::HTML::SelectItemOption const& item_option, bool in_option_group) {
-            auto label = in_option_group ? qformatted("    {}", item_option.label) : qstring_from_ak_string(item_option.label);
+            auto label = in_option_group ? qformatted("    {}", item_option.label) : qstring_from_utf16_string(item_option.label);
 
             QAction* action = new QAction(label, this);
             action->setCheckable(true);
@@ -198,7 +202,7 @@ WebContentView::WebContentView(QWidget* window, RefPtr<WebView::WebContentClient
         for (auto const& item : items) {
             if (item.has<Web::HTML::SelectItemOptionGroup>()) {
                 auto const& item_option_group = item.get<Web::HTML::SelectItemOptionGroup>();
-                QAction* subtitle = new QAction(qstring_from_ak_string(item_option_group.label), this);
+                QAction* subtitle = new QAction(qstring_from_utf16_string(item_option_group.label), this);
                 subtitle->setDisabled(true);
                 m_select_dropdown->addAction(subtitle);
 
@@ -290,6 +294,35 @@ static Web::UIEvents::KeyModifier get_modifiers_from_qt_key_event(QKeyEvent cons
     if (event.modifiers().testFlag(Qt::KeypadModifier))
         modifiers |= Web::UIEvents::KeyModifier::Mod_Keypad;
     return modifiers;
+}
+
+static QPointF wheel_delta_from_angle_delta(QPoint angle_delta)
+{
+    static constexpr double wheel_delta_units_per_step = static_cast<double>(QWheelEvent::DefaultDeltasPerStep);
+    double delta_x = -static_cast<double>(angle_delta.x()) / wheel_delta_units_per_step;
+    double delta_y = static_cast<double>(angle_delta.y()) / wheel_delta_units_per_step;
+
+    static constexpr double scroll_step_size = 40;
+    auto step_x = delta_x * static_cast<double>(QApplication::wheelScrollLines());
+    auto step_y = delta_y * static_cast<double>(QApplication::wheelScrollLines());
+
+    return { step_x * scroll_step_size, step_y * scroll_step_size };
+}
+
+static QPointF wheel_delta_from_qt_event(QWheelEvent const& wheel_event)
+{
+    auto pixel_delta = -wheel_event.pixelDelta();
+    auto const* pointing_device = wheel_event.pointingDevice();
+    // NB: macOS can report a tiny pixel delta for mouse-wheel ticks. Use it only for touchpads so physical wheels
+    //     continue through the line-step conversion below.
+    if (!pixel_delta.isNull() && pointing_device && pointing_device->type() == QInputDevice::DeviceType::TouchPad)
+        return pixel_delta;
+
+    auto angle_delta = -wheel_event.angleDelta();
+    if (!angle_delta.isNull())
+        return wheel_delta_from_angle_delta(angle_delta);
+
+    return pixel_delta;
 }
 
 static Web::UIEvents::KeyCode get_keycode_from_qt_key_event(QKeyEvent const& event)
@@ -455,6 +488,9 @@ static bool is_browser_reserved_shortcut(QKeyEvent const& event)
         return true;
 
 #if defined(AK_OS_MACOS)
+    if (modifiers == Qt::ControlModifier && key == Qt::Key_H)
+        return true;
+
     if (modifiers == Qt::MetaModifier && key == Qt::Key_Tab)
         return true;
 
@@ -699,12 +735,28 @@ void WebContentView::dropEvent(QDropEvent* event)
 
 void WebContentView::focusInEvent(QFocusEvent*)
 {
-    client().async_set_has_focus(m_client_state.page_index, true);
+    update_page_focus();
 }
 
 void WebContentView::focusOutEvent(QFocusEvent*)
 {
-    client().async_set_has_focus(m_client_state.page_index, false);
+    update_page_focus();
+}
+
+void WebContentView::update_page_focus()
+{
+    // Focus can move between this widget, the native window container, and the embedded native window in bursts of
+    // events whose order is not meaningful (e.g. the container reports losing focus after native focus has already
+    // moved to the embedded window). Instead of trusting individual events, evaluate the resulting focus state once
+    // the burst has settled.
+    QTimer::singleShot(0, this, [this] {
+        auto focused = hasFocus();
+#ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
+        if (!focused)
+            focused = vulkan_window_has_native_focus();
+#endif
+        client().async_set_has_focus(m_client_state.page_index, focused);
+    });
 }
 
 Optional<WebContentView::Paintable> WebContentView::current_paintable() const
@@ -824,6 +876,23 @@ void WebContentView::set_device_pixel_ratio(double device_pixel_ratio)
     handle_resize();
 }
 
+void WebContentView::set_vertical_tab_overlay_insets([[maybe_unused]] int left, [[maybe_unused]] int right)
+{
+#ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
+    if (m_vertical_tab_overlay_left == left && m_vertical_tab_overlay_right == right)
+        return;
+
+    // While vertical tabs are hover-expanded they overlay this view. On the Vulkan presentation path, the native window
+    // would occlude them, so we clear these left/right strips (in logical pixels) to transparent, letting the tab
+    // column that paints in the widget backing store show through.
+    m_vertical_tab_overlay_left = left;
+    m_vertical_tab_overlay_right = right;
+
+    update_vulkan_window_input_region();
+    schedule_repaint();
+#endif
+}
+
 void WebContentView::set_zoom_level(double zoom_level)
 {
     m_zoom_level = zoom_level;
@@ -906,10 +975,22 @@ static Core::AnonymousBuffer make_system_theme_from_qt_palette(QWidget& widget, 
     translate(Gfx::ColorRole::ButtonText, QPalette::ColorRole::ButtonText);
 #ifdef AK_OS_MACOS
     palette.set_color(Gfx::ColorRole::Selection, WebView::macos_web_selection_color());
-    palette.set_color(Gfx::ColorRole::InactiveSelection, appkit_web_inactive_selection_color());
-    palette.set_color(Gfx::ColorRole::InactiveSelectionText, appkit_web_inactive_selection_text_color());
+    palette.set_color(Gfx::ColorRole::InactiveSelection, WebView::macos_web_inactive_selection_color());
+    palette.set_color(Gfx::ColorRole::InactiveSelectionText, WebView::macos_web_inactive_selection_text_color());
 #else
     translate(Gfx::ColorRole::Selection, QPalette::ColorRole::Highlight);
+
+    auto active_highlight = qt_palette.color(QPalette::Active, QPalette::ColorRole::Highlight);
+    auto inactive_highlight = qt_palette.color(QPalette::Inactive, QPalette::ColorRole::Highlight);
+    if (inactive_highlight != active_highlight) {
+        palette.set_color(Gfx::ColorRole::InactiveSelection, Gfx::Color::from_bgra(inactive_highlight.rgba()));
+        auto inactive_highlighted_text = qt_palette.color(QPalette::Inactive, QPalette::ColorRole::HighlightedText);
+        palette.set_color(Gfx::ColorRole::InactiveSelectionText, Gfx::Color::from_bgra(inactive_highlighted_text.rgba()));
+    } else {
+        // The Qt theme does not differentiate inactive selections; use a neutral gray.
+        auto inactive_selection = is_using_dark_system_theme(widget) ? Gfx::Color(0x60, 0x60, 0x60) : Gfx::Color(0xd4, 0xd4, 0xd4);
+        palette.set_color(Gfx::ColorRole::InactiveSelection, inactive_selection);
+    }
 #endif
 
     palette.set_flag(Gfx::FlagRole::IsDark, is_using_dark_system_theme(widget));
@@ -1116,6 +1197,9 @@ bool WebContentView::event(QEvent* event)
         return true;
     }
 
+    if (event->type() == QEvent::ActivationChange)
+        update_page_focus();
+
     return WebContentViewBase::event(event);
 }
 
@@ -1217,22 +1301,9 @@ void WebContentView::enqueue_native_event(Web::MouseEvent::Type type, QSinglePoi
 
     if (type == Web::MouseEvent::Type::MouseWheel) {
         auto const& wheel_event = static_cast<QWheelEvent const&>(event);
-
-        if (auto pixel_delta = -wheel_event.pixelDelta(); !pixel_delta.isNull()) {
-            wheel_delta_x = pixel_delta.x();
-            wheel_delta_y = pixel_delta.y();
-        } else {
-            auto angle_delta = -wheel_event.angleDelta();
-            double delta_x = -static_cast<double>(angle_delta.x()) / 120.0;
-            double delta_y = static_cast<double>(angle_delta.y()) / 120.0;
-
-            static constexpr double scroll_step_size = 40;
-            auto step_x = delta_x * static_cast<double>(QApplication::wheelScrollLines());
-            auto step_y = delta_y * static_cast<double>(QApplication::wheelScrollLines());
-
-            wheel_delta_x = step_x * scroll_step_size;
-            wheel_delta_y = step_y * scroll_step_size;
-        }
+        auto wheel_delta = wheel_delta_from_qt_event(wheel_event);
+        wheel_delta_x = wheel_delta.x();
+        wheel_delta_y = wheel_delta.y();
     }
 
     enqueue_input_event(Web::MouseEvent { type, position, screen_position.to_type<Web::DevicePixels>(), button, buttons, modifiers, wheel_delta_x, wheel_delta_y, m_click_count, nullptr });

@@ -20,6 +20,7 @@
 #include <AK/ScopeGuard.h>
 #include <AK/StringBuilder.h>
 #include <AK/Time.h>
+#include <AK/Utf16StringBuilder.h>
 #include <AK/Utf8View.h>
 #include <LibCore/Timer.h>
 #include <LibGC/RootVector.h>
@@ -454,7 +455,7 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     document->m_about_base_url = navigation_params.about_base_url;
     document->set_url(*creation_url);
     document->m_readiness = HTML::DocumentReadyState::Loading;
-    document->set_allow_declarative_shadow_roots(true);
+    document->set_allow_declarative_shadow_roots(HTML::HTMLParser::AllowDeclarativeShadowRoots::Yes);
     document->set_custom_element_registry(realm.create<HTML::CustomElementRegistry>(realm));
 
     document->m_window = window;
@@ -509,7 +510,8 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     // 17. If navigationParams's response has a `Refresh` header, then:
     if (auto maybe_refresh = navigation_params.response->header_list()->get("Refresh"sv); maybe_refresh.has_value()) {
         // 1. Let value be the isomorphic decoding of the value of the header.
-        auto value = TextCodec::isomorphic_decode(maybe_refresh.value());
+        auto decoded_value = TextCodec::isomorphic_decode(maybe_refresh.value());
+        auto value = Utf16String::from_utf8(decoded_value.bytes_as_string_view());
 
         // 2. Run the shared declarative refresh steps with document and value.
         document->shared_declarative_refresh_steps(value, nullptr);
@@ -593,12 +595,7 @@ Document::~Document() = default;
 void Document::set_temporary_document_for_fragment_parsing(Badge<HTML::HTMLParser>)
 {
     // https://html.spec.whatwg.org/multipage/parsing.html#html-fragment-parsing-algorithm
-    // AD-HOC: The HTML fragment parsing algorithm stages nodes in a temporary document before returning them.
-    // Treat that document as disconnected so post-connection steps happen only after the fragment is inserted
-    // into the context document.
-    // Spec issue: https://github.com/whatwg/html/issues/11023
     m_temporary_document_for_fragment_parsing = true;
-    set_is_connected(false);
 }
 
 void Document::set_style_invalidation_counter_dump_interval(Optional<u64> interval)
@@ -814,23 +811,21 @@ String const& Document::content_blocker_style_sheet()
         m_content_blocker_style_sheet_checked_classes.clear();
         m_content_blocker_style_sheet_checked_ids.clear();
 
-        Vector<String> classes;
-        Vector<String> ids;
+        Vector<Utf16FlyString> classes;
+        Vector<Utf16FlyString> ids;
         for_each_shadow_including_descendant([&](DOM::Node& node) {
             auto* element = as_if<DOM::Element>(node);
             if (!element)
                 return TraversalDecision::Continue;
 
             if (auto const& id = element->id(); id.has_value()) {
-                auto id_string = id->to_string();
-                if (!id_string.is_empty() && m_content_blocker_style_sheet_checked_ids.set(*id) == AK::HashSetResult::InsertedNewEntry)
-                    ids.append(move(id_string));
+                if (!id->is_empty() && m_content_blocker_style_sheet_checked_ids.set(*id) == AK::HashSetResult::InsertedNewEntry)
+                    ids.append(*id);
             }
 
             for (auto const& class_name : element->class_names()) {
-                auto class_string = class_name.to_string();
-                if (!class_string.is_empty() && m_content_blocker_style_sheet_checked_classes.set(class_name) == AK::HashSetResult::InsertedNewEntry)
-                    classes.append(move(class_string));
+                if (!class_name.is_empty() && m_content_blocker_style_sheet_checked_classes.set(class_name) == AK::HashSetResult::InsertedNewEntry)
+                    classes.append(class_name);
             }
 
             return TraversalDecision::Continue;
@@ -849,7 +844,7 @@ void Document::invalidate_content_blocker_style_sheet()
     m_content_blocker_style_sheet_checked_ids.clear();
 }
 
-bool Document::content_blocker_style_sheet_may_need_refresh_for_class_or_id(FlyString const* id, ReadonlySpan<FlyString> class_names)
+bool Document::content_blocker_style_sheet_may_need_refresh_for_class_or_id(Utf16FlyString const* id, ReadonlySpan<Utf16FlyString> class_names)
 {
     if (is_decoded_svg())
         return false;
@@ -857,12 +852,11 @@ bool Document::content_blocker_style_sheet_may_need_refresh_for_class_or_id(FlyS
     if (!m_content_blocker_style_sheet.has_value())
         return false;
 
-    Vector<String> classes_to_check;
-    Vector<String> ids_to_check;
-    auto append_new_token = [](FlyString const& token, HashTable<FlyString>& checked_tokens, Vector<String>& tokens_to_check) {
-        auto token_string = token.to_string();
-        if (!token_string.is_empty() && checked_tokens.set(token) == AK::HashSetResult::InsertedNewEntry)
-            tokens_to_check.append(move(token_string));
+    Vector<Utf16FlyString> classes_to_check;
+    Vector<Utf16FlyString> ids_to_check;
+    auto append_new_token = [](Utf16FlyString const& token, HashTable<Utf16FlyString>& checked_tokens, Vector<Utf16FlyString>& tokens_to_check) {
+        if (!token.is_empty() && checked_tokens.set(token) == AK::HashSetResult::InsertedNewEntry)
+            tokens_to_check.append(token);
     };
 
     if (id)
@@ -905,7 +899,7 @@ WebIDL::ExceptionOr<void> Document::writeln(Vector<TrustedTypes::TrustedHTMLOrSt
 WebIDL::ExceptionOr<void> Document::run_the_document_write_steps(Vector<TrustedTypes::TrustedHTMLOrString> const& text, AddLineFeed line_feed, TrustedTypes::InjectionSink sink)
 {
     // 1. Let string be the empty string.
-    StringBuilder string;
+    Utf16StringBuilder string;
 
     // 2. Let isTrusted be false if text contains a string; otherwise true.
     auto is_trusted = true;
@@ -919,11 +913,10 @@ WebIDL::ExceptionOr<void> Document::run_the_document_write_steps(Vector<TrustedT
     // 3. For each value of text:
     for (auto const& value : text) {
         string.append(value.visit(
-                               // 1. If value is a TrustedHTML object, then append value's associated data to string.
-                               [](GC::Root<TrustedTypes::TrustedHTML> const& value) { return value->to_string(); },
-                               // 2. Otherwise, append value to string.
-                               [](Utf16String const& value) { return value; })
-                .to_utf8_but_should_be_ported_to_utf16());
+            // 1. If value is a TrustedHTML object, then append value's associated data to string.
+            [](GC::Root<TrustedTypes::TrustedHTML> const& value) { return value->to_string().utf16_view(); },
+            // 2. Otherwise, append value to string.
+            [](Utf16String const& value) { return value.utf16_view(); }));
     }
 
     // 4. If isTrusted is false, set string to the result of invoking the Get Trusted Type compliant string algorithm
@@ -932,16 +925,16 @@ WebIDL::ExceptionOr<void> Document::run_the_document_write_steps(Vector<TrustedT
         auto const new_string = TRY(TrustedTypes::get_trusted_type_compliant_string(
             TrustedTypes::TrustedTypeName::TrustedHTML,
             relevant_global_object(*this),
-            Utf16String::from_utf8(MUST(string.to_string())),
+            string.to_string(),
             sink,
             TrustedTypes::Script.to_string()));
         string.clear();
-        string.append(new_string.to_utf8_but_should_be_ported_to_utf16());
+        string.append(new_string.utf16_view());
     }
 
     // 5. If lineFeed is true, append U+000A LINE FEED to string.
     if (line_feed == AddLineFeed::Yes)
-        string.append('\n');
+        string.append_ascii('\n');
 
     // 6. If document is an XML document, then throw an "InvalidStateError" DOMException.
     if (m_type == Type::XML)
@@ -966,7 +959,7 @@ WebIDL::ExceptionOr<void> Document::run_the_document_write_steps(Vector<TrustedT
     }
 
     // 10. Insert string into the input stream just before the insertion point.
-    m_parser->tokenizer().insert_input_at_insertion_point(string.string_view());
+    m_parser->tokenizer().insert_input_at_insertion_point(string.view());
 
     // 11. If document's pending parsing-blocking script is null, then have the HTML parser process string, one code
     //     point at a time, processing resulting tokens as they are emitted, and stopping when the tokenizer reaches
@@ -1057,16 +1050,23 @@ WebIDL::ExceptionOr<Document*> Document::open(Optional<String> const&, Optional<
     // 15. Set document to no-quirks mode.
     set_quirks_mode(QuirksMode::No);
 
-    // 16. Create a new HTML parser and associate it with document. This is a script-created parser (meaning that it can be closed by the document.open() and document.close() methods, and that the tokenizer will wait for an explicit call to document.close() before emitting an end-of-file token). The encoding confidence is irrelevant.
+    // 16. Create an HTML parser whose allow declarative shadow roots is document's allow declarative shadow roots, and
+    //     associate it with document. This is a script-created parser (meaning that it can be closed by the document.open()
+    //     and document.close() methods, and that the tokenizer will wait for an explicit call to document.close() before
+    //     emitting an end-of-file token). The encoding confidence is irrelevant.
     m_parser = HTML::HTMLParser::create_for_scripting(*this);
+    m_parser->set_allow_declarative_shadow_roots(allow_declarative_shadow_roots());
 
     // 17. Set the insertion point to point at just before the end of the input stream (which at this point will be empty).
     m_parser->tokenizer().update_insertion_point();
 
-    // 18. Update the current document readiness of document to "loading".
+    // 18. Set the parser's allow declarative shadow roots to true.
+    m_parser->set_allow_declarative_shadow_roots(HTML::HTMLParser::AllowDeclarativeShadowRoots::Yes);
+
+    // 19. Update the current document readiness of document to "loading".
     update_readiness(HTML::DocumentReadyState::Loading);
 
-    // 19. Return document.
+    // 20. Return document.
     return this;
 }
 
@@ -1223,7 +1223,7 @@ GC::Ptr<HTML::HTMLTitleElement> Document::title_element()
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#dom-document-dir
-StringView Document::dir() const
+Utf16String Document::dir() const
 {
     // The dir IDL attribute on Document objects must reflect the dir content attribute of the html
     // element, if any, limited to only known values. If there is no such element, then the
@@ -1231,11 +1231,11 @@ StringView Document::dir() const
     if (auto html = html_element())
         return html->dir();
 
-    return ""sv;
+    return {};
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#dom-document-dir
-void Document::set_dir(String const& dir)
+void Document::set_dir(Utf16String const& dir)
 {
     // The dir IDL attribute on Document objects must reflect the dir content attribute of the html
     // element, if any, limited to only known values. If there is no such element, then the
@@ -1430,7 +1430,7 @@ CSS::PreferredColorScheme Document::canvas_color_scheme() const
             color_scheme = CSS::PreferredColorScheme::Dark;
         } else if (root_color_scheme_is_normal && m_supported_color_schemes.has_value()) {
             auto preferred_color_scheme = page().preferred_color_scheme();
-            if (m_supported_color_schemes->contains_slow(CSS::preferred_color_scheme_to_string(preferred_color_scheme)))
+            if (m_supported_color_schemes->contains_slow(CSS::preferred_color_scheme_to_utf16_fly_string(preferred_color_scheme)))
                 color_scheme = preferred_color_scheme;
         }
     }
@@ -1633,6 +1633,12 @@ Optional<URL::URL> Document::encoding_parse_url(StringView url) const
     return DOMURL::parse(url, base_url, encoding);
 }
 
+Optional<URL::URL> Document::encoding_parse_url(Utf16View url) const
+{
+    auto encoding = encoding_or_default();
+    return DOMURL::parse(url, base_url(), encoding);
+}
+
 // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#encoding-parsing-and-serializing-a-url
 Optional<String> Document::encoding_parse_and_serialize_url(StringView url) const
 {
@@ -1644,6 +1650,14 @@ Optional<String> Document::encoding_parse_and_serialize_url(StringView url) cons
         return {};
 
     // 3. Return the result of applying the URL serializer to url.
+    return parsed_url->serialize();
+}
+
+Optional<String> Document::encoding_parse_and_serialize_url(Utf16String const& url) const
+{
+    auto parsed_url = encoding_parse_url(url);
+    if (!parsed_url.has_value())
+        return {};
     return parsed_url->serialize();
 }
 
@@ -1858,28 +1872,6 @@ void Document::update_layout(UpdateLayoutReason reason)
                 node_with_style->set_layout_index(layout_index_counter++);
 
             layout_node.recompute_containing_block({});
-
-            auto* box = as_if<Layout::Box>(layout_node);
-            if (!box)
-                return TraversalDecision::Continue;
-
-            box->clear_contained_abspos_children();
-
-            if (!box->is_absolutely_positioned())
-                return TraversalDecision::Continue;
-
-            if (auto containing_block = box->containing_block()) {
-                auto closest_box_that_establishes_formatting_context = containing_block;
-                while (closest_box_that_establishes_formatting_context) {
-                    if (closest_box_that_establishes_formatting_context == m_layout_root)
-                        break;
-                    if (Layout::FormattingContext::formatting_context_type_created_by_box(*closest_box_that_establishes_formatting_context).has_value())
-                        break;
-                    closest_box_that_establishes_formatting_context = closest_box_that_establishes_formatting_context->containing_block();
-                }
-                VERIFY(closest_box_that_establishes_formatting_context);
-                closest_box_that_establishes_formatting_context->add_contained_abspos_child(*box);
-            }
 
             return TraversalDecision::Continue;
         });
@@ -2144,17 +2136,17 @@ void Document::set_visited_link_color(Color color)
     m_visited_link_color = color;
 }
 
-Optional<Vector<String> const&> Document::supported_color_schemes() const
+Optional<Vector<Utf16FlyString> const&> Document::supported_color_schemes() const
 {
     return m_supported_color_schemes;
 }
 
-void Document::set_supported_color_schemes(Vector<String> supported_color_schemes)
+void Document::set_supported_color_schemes(Vector<Utf16FlyString> supported_color_schemes)
 {
-    set_supported_color_schemes(Optional<Vector<String>> { move(supported_color_schemes) });
+    set_supported_color_schemes(Optional<Vector<Utf16FlyString>> { move(supported_color_schemes) });
 }
 
-void Document::set_supported_color_schemes(Optional<Vector<String>> supported_color_schemes)
+void Document::set_supported_color_schemes(Optional<Vector<Utf16FlyString>> supported_color_schemes)
 {
     if (m_supported_color_schemes == supported_color_schemes)
         return;
@@ -2167,7 +2159,7 @@ void Document::set_supported_color_schemes(Optional<Vector<String>> supported_co
 // https://html.spec.whatwg.org/multipage/semantics.html#meta-color-scheme
 void Document::obtain_supported_color_schemes()
 {
-    Optional<Vector<String>> supported_color_schemes;
+    Optional<Vector<Utf16FlyString>> supported_color_schemes;
 
     // 1. Let candidate elements be the list of all meta elements that meet the following criteria, in tree order:
     for_each_in_subtree_of_type<HTML::HTMLMetaElement>([&](HTML::HTMLMetaElement& element) {
@@ -2220,7 +2212,7 @@ void Document::obtain_theme_color()
             }
 
             // 2. Let value be the result of stripping leading and trailing ASCII whitespace from the value of element's content attribute.
-            auto value = content->bytes_as_string_view().trim(Infra::ASCII_WHITESPACE);
+            auto value = content->utf16_view().trim(Infra::ASCII_WHITESPACE);
 
             // 3. Let color be the result of parsing value.
             auto css_value = parse_css_value(context, value, CSS::PropertyID::Color);
@@ -2648,7 +2640,7 @@ void Document::set_hovered_node(GC::Ptr<Node> node, Optional<HoverEventData> hov
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#dom-document-getelementsbyname
-GC::Ref<NodeList> Document::get_elements_by_name(FlyString const& name)
+GC::Ref<NodeList> Document::get_elements_by_name(Utf16String const& name)
 {
     return LiveNodeList::create(realm(), *this, LiveNodeList::Scope::Descendants, [name](auto const& node) {
         if (!is<HTML::HTMLElement>(node))
@@ -2796,33 +2788,32 @@ HTML::EnvironmentSettingsObject& Document::relevant_settings_object() const
 }
 
 // https://dom.spec.whatwg.org/#dom-document-createelement
-WebIDL::ExceptionOr<GC::Ref<Element>> Document::create_element(String const& local_name, Variant<String, Bindings::ElementCreationOptions> const& options)
+WebIDL::ExceptionOr<GC::Ref<Element>> Document::create_element(Utf16FlyString local_name, Variant<Utf16FlyString, Bindings::ElementCreationOptions> const& options)
 {
     // 1. If localName is not a valid element local name, then throw an "InvalidCharacterError" DOMException.
-    if (!is_valid_element_local_name(local_name))
+    if (!is_valid_element_local_name(local_name.view()))
         return WebIDL::InvalidCharacterError::create(realm(), "Invalid character in tag name."_utf16);
 
     // 2. If this is an HTML document, then set localName to localName in ASCII lowercase.
-    auto local_name_lower = document_type() == Type::HTML
-        ? local_name.to_ascii_lowercase()
-        : local_name;
+    if (document_type() == Type::HTML)
+        local_name = local_name.to_ascii_lowercase();
 
     // 3. Let registry and is be the result of flattening element creation options given options and this.
     auto [registry, is_value] = TRY(flatten_element_creation_options(options));
 
     // 4. Let namespace be the HTML namespace, if this is an HTML document or this’s content type is
     //    "application/xhtml+xml"; otherwise null.
-    Optional<FlyString> namespace_;
+    Optional<Utf16FlyString> namespace_;
     if (document_type() == Type::HTML || content_type() == "application/xhtml+xml"sv)
         namespace_ = Namespace::HTML;
 
     // 5. Return the result of creating an element given this, localName, namespace, null, is, true, and registry.
-    return TRY(DOM::create_element(*this, FlyString::from_utf8_without_validation(local_name_lower.bytes()), move(namespace_), {}, move(is_value), true, registry));
+    return TRY(DOM::create_element(*this, move(local_name), move(namespace_), {}, move(is_value), true, registry));
 }
 
 // https://dom.spec.whatwg.org/#dom-document-createelementns
 // https://dom.spec.whatwg.org/#internal-createelementns-steps
-WebIDL::ExceptionOr<GC::Ref<Element>> Document::create_element_ns(Optional<FlyString> const& namespace_, String const& qualified_name, Variant<String, Bindings::ElementCreationOptions> const& options)
+WebIDL::ExceptionOr<GC::Ref<Element>> Document::create_element_ns(Optional<Utf16FlyString> namespace_, Utf16FlyString const& qualified_name, Variant<Utf16FlyString, Bindings::ElementCreationOptions> const& options)
 {
     // 1. Let (namespace, prefix, localName) be the result of validating and extracting namespace and qualifiedName
     //    given "element".
@@ -2866,10 +2857,10 @@ GC::Ref<Comment> Document::create_comment(Utf16String data)
 }
 
 // https://dom.spec.whatwg.org/#dom-document-createprocessinginstruction
-WebIDL::ExceptionOr<GC::Ref<ProcessingInstruction>> Document::create_processing_instruction(String const& target, Utf16String data)
+WebIDL::ExceptionOr<GC::Ref<ProcessingInstruction>> Document::create_processing_instruction(Utf16FlyString const& target, Utf16String data)
 {
     // 1. If target does not match the Name production, then throw an "InvalidCharacterError" DOMException.
-    if (!is_valid_name(target))
+    if (!is_valid_name(target.view()))
         return WebIDL::InvalidCharacterError::create(realm(), "Invalid character in target name."_utf16);
 
     // 2. If data contains the string "?>", then throw an "InvalidCharacterError" DOMException.
@@ -3129,17 +3120,18 @@ void Document::adopt_node(Node& node)
 // https://dom.spec.whatwg.org/#dom-document-adoptnode
 WebIDL::ExceptionOr<GC::Ref<Node>> Document::adopt_node_binding(GC::Ref<Node> node)
 {
+    // 1. If node is a document, then throw a "NotSupportedError" DOMException.
     if (is<Document>(*node))
         return WebIDL::NotSupportedError::create(realm(), "Cannot adopt a document into a document"_utf16);
 
+    // 2. If node is a shadow root, then throw a "HierarchyRequestError" DOMException.
     if (is<ShadowRoot>(*node))
         return WebIDL::HierarchyRequestError::create(realm(), "Cannot adopt a shadow root into a document"_utf16);
 
-    if (auto* fragment = as_if<DocumentFragment>(*node); fragment && fragment->host())
-        return node;
-
+    // 3. Adopt node into this.
     adopt_node(*node);
 
+    // 4. Return node.
     return node;
 }
 
@@ -3189,7 +3181,11 @@ void Document::set_focused_area(GC::Ptr<Node> node)
     set_needs_repaint();
 
     // Scroll the viewport if necessary to make the newly focused element visible.
-    if (new_focused_element) {
+    // NB: Not if the focused element is a navigable container: focus moving into a frame lands on its container
+    //     element in this document, and other engines do not scroll embedded content into view on focus. Ad
+    //     scripts commonly pull focus into an offscreen iframe during page load, and scrolling to it would
+    //     hijack the viewport.
+    if (new_focused_element && !is<HTML::NavigableContainer>(*new_focused_element)) {
         new_focused_element->queue_an_element_task(HTML::Task::Source::UserInteraction, [new_focused_element] {
             if (new_focused_element->document().focused_area().ptr() != new_focused_element)
                 return;
@@ -3347,7 +3343,8 @@ Document::IndicatedPart Document::determine_the_indicated_part() const
         return Document::TopOfTheDocument {};
 
     // 3. Let potentialIndicatedElement be the result of finding a potential indicated element given document and fragment.
-    auto* potential_indicated_element = find_a_potential_indicated_element(*fragment);
+    auto fragment_as_utf16 = Utf16String::from_utf8(*fragment);
+    auto* potential_indicated_element = find_a_potential_indicated_element(fragment_as_utf16);
 
     // 4. If potentialIndicatedElement is not null, then return potentialIndicatedElement.
     if (potential_indicated_element)
@@ -3355,7 +3352,7 @@ Document::IndicatedPart Document::determine_the_indicated_part() const
 
     // 5. Let fragmentBytes be the result of percent-decoding fragment.
     // 6. Let decodedFragment be the result of running UTF-8 decode without BOM on fragmentBytes.
-    auto decoded_fragment = String::from_utf8_with_replacement_character(URL::percent_decode(*fragment), String::WithBOMHandling::No);
+    auto decoded_fragment = Utf16String::from_utf8_with_replacement_character(URL::percent_decode(*fragment), Utf16String::WithBOMHandling::No);
 
     // 7. Set potentialIndicatedElement to the result of finding a potential indicated element given document and decodedFragment.
     potential_indicated_element = find_a_potential_indicated_element(decoded_fragment);
@@ -3365,7 +3362,7 @@ Document::IndicatedPart Document::determine_the_indicated_part() const
         return potential_indicated_element;
 
     // 9. If decodedFragment is an ASCII case-insensitive match for the string top, then return the top of the document.
-    if (decoded_fragment.equals_ignoring_ascii_case("top"sv))
+    if (decoded_fragment.utf16_view().equals_ignoring_ascii_case("top"sv))
         return Document::TopOfTheDocument {};
 
     // 10. Return null.
@@ -3373,20 +3370,21 @@ Document::IndicatedPart Document::determine_the_indicated_part() const
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#find-a-potential-indicated-element
-Element* Document::find_a_potential_indicated_element(FlyString const& fragment) const
+Element* Document::find_a_potential_indicated_element(Utf16String const& fragment) const
 {
     // To find a potential indicated element given a Document document and a string fragment, run these steps:
+    auto fragment_fly_string = Utf16FlyString::from_utf16(fragment.utf16_view());
 
     // 1. If there is an element in the document tree whose root is document and that has an ID equal to
     //    fragment, then return the first such element in tree order.
-    if (auto element = get_element_by_id(fragment))
+    if (auto element = get_element_by_id(fragment_fly_string))
         return const_cast<Element*>(element.ptr());
 
     // 2. If there is an a element in the document tree whose root is document that has a name attribute
     //    whose value is equal to fragment, then return the first such element in tree order.
     Element* element_with_name = nullptr;
     root().for_each_in_subtree_of_type<Element>([&](Element const& element) {
-        if (element.name() == fragment) {
+        if (element.name() == fragment_fly_string) {
             element_with_name = const_cast<Element*>(&element);
             return TraversalDecision::Break;
         }
@@ -3475,10 +3473,10 @@ void Document::dispatch_events_for_transition(GC::Ref<CSS::CSSTransition> transi
 
         Bindings::TransitionEventInit event_init {};
         event_init.bubbles = true;
-        event_init.property_name = transition->transition_property().to_utf16_string().to_utf8_but_should_be_ported_to_utf16();
+        event_init.property_name = transition->transition_property().to_utf16_string();
         event_init.elapsed_time = elapsed_time_output;
         event_init.pseudo_element = transition->owning_element()->pseudo_element().map([](auto it) {
-                                                                                      return MUST(String::formatted("::{}", CSS::pseudo_element_name(it)));
+                                                                                      return Utf16String::formatted("::{}", CSS::pseudo_element_name(it));
                                                                                   })
                                         .value_or({});
 
@@ -3583,10 +3581,10 @@ void Document::dispatch_events_for_animation_if_necessary(GC::Ref<Animations::An
 
         Bindings::AnimationEventInit event_init {};
         event_init.bubbles = true;
-        event_init.animation_name = static_cast<String>(css_animation.animation_name());
+        event_init.animation_name = css_animation.animation_name().to_utf16_string();
         event_init.elapsed_time = elapsed_time_output;
         event_init.pseudo_element = owning_element->pseudo_element().map([](auto it) {
-                                                                        return MUST(String::formatted("::{}", CSS::pseudo_element_name(it)));
+                                                                        return Utf16String::formatted("::{}", CSS::pseudo_element_name(it));
                                                                     })
                                         .value_or({});
 
@@ -3795,7 +3793,7 @@ void Document::update_readiness(HTML::DocumentReadyState readiness_value)
             if (!is_decoded_svg()) {
                 HTML::HTMLLinkElement::load_fallback_favicon_if_needed(*this);
             }
-            navigable->traversable_navigable()->page().client().page_did_finish_loading(url());
+            navigable->traversable_navigable()->page().client().page_did_finish_loading(m_navigation_id, url());
         } else {
             m_needs_to_call_page_did_load = true;
         }
@@ -3982,66 +3980,66 @@ bool Document::is_cookie_averse() const
     return false;
 }
 
-String Document::fg_color() const
+Utf16String Document::fg_color() const
 {
     if (auto* body_element = body(); body_element && !is<HTML::HTMLFrameSetElement>(*body_element))
         return body_element->get_attribute_value(HTML::AttributeNames::text);
-    return ""_string;
+    return {};
 }
 
-void Document::set_fg_color(String const& value)
+void Document::set_fg_color(Utf16String const& value)
 {
     if (auto* body_element = body(); body_element && !is<HTML::HTMLFrameSetElement>(*body_element))
         body_element->set_attribute_value(HTML::AttributeNames::text, value);
 }
 
-String Document::link_color() const
+Utf16String Document::link_color() const
 {
     if (auto* body_element = body(); body_element && !is<HTML::HTMLFrameSetElement>(*body_element))
         return body_element->get_attribute_value(HTML::AttributeNames::link);
-    return ""_string;
+    return {};
 }
 
-void Document::set_link_color(String const& value)
+void Document::set_link_color(Utf16String const& value)
 {
     if (auto* body_element = body(); body_element && !is<HTML::HTMLFrameSetElement>(*body_element))
         body_element->set_attribute_value(HTML::AttributeNames::link, value);
 }
 
-String Document::vlink_color() const
+Utf16String Document::vlink_color() const
 {
     if (auto* body_element = body(); body_element && !is<HTML::HTMLFrameSetElement>(*body_element))
         return body_element->get_attribute_value(HTML::AttributeNames::vlink);
-    return ""_string;
+    return {};
 }
 
-void Document::set_vlink_color(String const& value)
+void Document::set_vlink_color(Utf16String const& value)
 {
     if (auto* body_element = body(); body_element && !is<HTML::HTMLFrameSetElement>(*body_element))
         body_element->set_attribute_value(HTML::AttributeNames::vlink, value);
 }
 
-String Document::alink_color() const
+Utf16String Document::alink_color() const
 {
     if (auto* body_element = body(); body_element && !is<HTML::HTMLFrameSetElement>(*body_element))
         return body_element->get_attribute_value(HTML::AttributeNames::alink);
-    return ""_string;
+    return {};
 }
 
-void Document::set_alink_color(String const& value)
+void Document::set_alink_color(Utf16String const& value)
 {
     if (auto* body_element = body(); body_element && !is<HTML::HTMLFrameSetElement>(*body_element))
         body_element->set_attribute_value(HTML::AttributeNames::alink, value);
 }
 
-String Document::bg_color() const
+Utf16String Document::bg_color() const
 {
     if (auto* body_element = body(); body_element && !is<HTML::HTMLFrameSetElement>(*body_element))
         return body_element->get_attribute_value(HTML::AttributeNames::bgcolor);
-    return ""_string;
+    return {};
 }
 
-void Document::set_bg_color(String const& value)
+void Document::set_bg_color(Utf16String const& value)
 {
     if (auto* body_element = body(); body_element && !is<HTML::HTMLFrameSetElement>(*body_element))
         body_element->set_attribute_value(HTML::AttributeNames::bgcolor, value);
@@ -4356,7 +4354,7 @@ bool Document::has_focus() const
         auto focused_area = candidate->focused_area();
         if (auto* navigable_container = as_if<HTML::NavigableContainer>(focused_area.ptr())) {
             if (auto content_navigable = navigable_container->content_navigable()) {
-                candidate = content_navigable->active_document();
+                candidate = as<HTML::LocalNavigable>(*content_navigable).active_document();
                 continue;
             }
         }
@@ -4429,18 +4427,17 @@ static inline bool is_valid_name_character(u32 code_point)
 }
 
 // https://www.w3.org/TR/xml/#NT-Name
-bool Document::is_valid_name(String const& name)
+bool Document::is_valid_name(Utf16View const& name)
 {
     if (name.is_empty())
         return false;
-    auto code_points = name.code_points();
-    auto it = code_points.begin();
+    auto it = name.begin();
 
     if (!is_valid_name_start_character(*it))
         return false;
     ++it;
 
-    for (; it != code_points.end(); ++it) {
+    for (; it != name.end(); ++it) {
         if (!is_valid_name_character(*it))
             return false;
     }
@@ -4814,7 +4811,7 @@ Vector<GC::Root<HTML::LocalNavigable>> Document::descendant_navigables()
                 return TraversalDecision::Continue;
 
             // 2. Extend navigables with navigableContainer's content navigable's active document's inclusive descendant navigables.
-            auto document = navigable_container.content_navigable()->active_document();
+            auto document = as<HTML::LocalNavigable>(*navigable_container.content_navigable()).active_document();
             // AD-HOC: If the descendant navigable doesn't have an active document, just skip over it.
             if (!document)
                 return TraversalDecision::Continue;
@@ -5030,7 +5027,7 @@ void Document::destroy()
     // Not in the spec:
     for (auto& navigable_container : HTML::NavigableContainer::all_instances()) {
         if (&navigable_container->document() == this && navigable_container->content_navigable()) {
-            auto& child_navigable = *navigable_container->content_navigable();
+            auto& child_navigable = as<HTML::LocalNavigable>(*navigable_container->content_navigable());
             child_navigable.set_has_been_destroyed();
             child_navigable.remove_from_all_local_navigables();
         }
@@ -5465,11 +5462,6 @@ GC::Ref<DOM::Document> Document::appropriate_template_contents_owner_document()
             if (document_type() == Type::HTML)
                 new_document->set_document_type(Type::HTML);
 
-            // AD-HOC: Copy over the "allow declarative shadow roots" flag, otherwise no elements inside templates will
-            //         be able to have declarative shadow roots.
-            // Spec issue: https://github.com/whatwg/html/issues/11955
-            new_document->set_allow_declarative_shadow_roots(allow_declarative_shadow_roots());
-
             // 3. Set document's associated inert template document to newDocument.
             m_associated_inert_template_document = new_document;
         }
@@ -5502,7 +5494,7 @@ String Document::dump_accessibility_tree_as_json()
 }
 
 // https://dom.spec.whatwg.org/#dom-document-createattribute
-WebIDL::ExceptionOr<GC::Ref<Attr>> Document::create_attribute(String const& local_name)
+WebIDL::ExceptionOr<GC::Ref<Attr>> Document::create_attribute(Utf16FlyString const& local_name)
 {
     // 1. If localName is not a valid attribute local name, then throw an "InvalidCharacterError" DOMException.
     if (!is_valid_attribute_local_name(local_name))
@@ -5510,11 +5502,15 @@ WebIDL::ExceptionOr<GC::Ref<Attr>> Document::create_attribute(String const& loca
 
     // 2. If this is an HTML document, then set localName to localName in ASCII lowercase.
     // 3. Return a new attribute whose local name is localName and node document is this.
-    return Attr::create(*this, is_html_document() ? local_name.to_ascii_lowercase() : local_name);
+    if (is_html_document()) {
+        auto lowercase_local_name = local_name.view().to_ascii_lowercase();
+        return Attr::create(*this, Utf16FlyString::from_utf16(lowercase_local_name.utf16_view()));
+    }
+    return Attr::create(*this, local_name);
 }
 
 // https://dom.spec.whatwg.org/#dom-document-createattributens
-WebIDL::ExceptionOr<GC::Ref<Attr>> Document::create_attribute_ns(Optional<FlyString> const& namespace_, String const& qualified_name)
+WebIDL::ExceptionOr<GC::Ref<Attr>> Document::create_attribute_ns(Optional<Utf16FlyString> namespace_, Utf16FlyString const& qualified_name)
 {
     // 1. Let (namespace, prefix, localName) be the result of validating and extracting namespace and qualifiedName given "attribute".
     auto extracted_qualified_name = TRY(validate_and_extract(realm(), namespace_, qualified_name, ValidationContext::Attribute));
@@ -5544,14 +5540,14 @@ void Document::make_active()
     if (current_navigable && current_navigable->is_top_level_traversable()) {
         page().client().page_did_change_active_document_in_top_level_browsing_context(*this);
     } else if (current_navigable) {
-        page().client().page_did_commit_child_frame_navigation(current_navigable->id(), url());
+        page().client().page_did_commit_child_frame_navigation(current_navigable->id(), current_navigable->replicated_state());
     }
 
     // 3. Set window's relevant settings object's execution ready flag.
     HTML::relevant_settings_object(window).execution_ready = true;
 
     if (m_needs_to_call_page_did_load) {
-        navigable()->traversable_navigable()->page().client().page_did_finish_loading(url());
+        navigable()->traversable_navigable()->page().client().page_did_finish_loading(m_navigation_id, url());
         m_needs_to_call_page_did_load = false;
     }
 
@@ -5984,14 +5980,14 @@ void Document::stop_intersection_observing_a_lazy_loading_element(Element& eleme
 }
 
 // https://html.spec.whatwg.org/multipage/semantics.html#shared-declarative-refresh-steps
-void Document::shared_declarative_refresh_steps(StringView input, GC::Ptr<HTML::HTMLMetaElement const> meta_element)
+void Document::shared_declarative_refresh_steps(Utf16View input, GC::Ptr<HTML::HTMLMetaElement const> meta_element)
 {
     // 1. If document's will declaratively refresh is true, then return.
     if (m_will_declaratively_refresh)
         return;
 
     // 2. Let position point at the first code point of input.
-    GenericLexer lexer(input);
+    Utf16GenericLexer lexer(input);
 
     // 3. Skip ASCII whitespace within input given position.
     lexer.ignore_while(Infra::is_ascii_whitespace);
@@ -6082,7 +6078,7 @@ void Document::shared_declarative_refresh_steps(StringView input, GC::Ptr<HTML::
         // 8. Skip quotes: If the code point in input pointed to by position is U+0027 (') or U+0022 ("), then let
         //    quote be that code point, and advance position to the next code point. Otherwise, let quote be the empty
         //    string.
-        Optional<char> quote;
+        Optional<u16> quote;
         if (lexer.peek() == '\'' || lexer.peek() == '"')
             quote = lexer.consume();
 
@@ -6563,6 +6559,22 @@ void Document::update_animations_and_send_events(double timestamp)
     //    the previous step.
     for (auto const& event : events_to_dispatch)
         event.target->dispatch_event(event.event);
+
+    // AD-HOC: Nothing else re-requests a rendering update while time-driven animations are running, since
+    //         Document::set_needs_animated_style_update() only requests a frame when its flag flips from
+    //         false to true, and the flag is both set and cleared within the same rendering update.
+    //         Without this, animations only advance when unrelated tasks happen to schedule rendering
+    //         updates. Keep the frame pump going as long as some animation attached to a monotonically
+    //         increasing timeline is running.
+    for (auto const& animation : m_associated_animations) {
+        if (animation.play_state() != Bindings::AnimationPlayState::Running)
+            continue;
+        auto timeline = animation.timeline();
+        if (!timeline || !timeline->is_monotonically_increasing())
+            continue;
+        page().client().request_frame();
+        break;
+    }
 }
 
 // https://www.w3.org/TR/web-animations-1/#remove-replaced-animations
@@ -6691,7 +6703,7 @@ static void insert_in_tree_order(Vector<GC::Ref<DOM::Element>>& elements, DOM::E
         elements.append(element);
 }
 
-void Document::element_id_changed(Badge<DOM::Element>, GC::Ref<DOM::Element> element, Optional<FlyString> old_id)
+void Document::element_id_changed(Badge<DOM::Element>, GC::Ref<DOM::Element> element, Optional<Utf16FlyString> old_id)
 {
     for (auto* form_associated_element : m_form_associated_elements_with_form_attribute)
         form_associated_element->element_id_changed({});
@@ -6761,7 +6773,7 @@ void Document::element_with_name_was_removed(Badge<DOM::Element>, GC::Ref<DOM::E
     }
 }
 
-GC::Ptr<Element> Document::element_by_anchor_name(FlyString const& name, Node const& querying_node) const
+GC::Ptr<Element> Document::element_by_anchor_name(Utf16FlyString const& name, Node const& querying_node) const
 {
     // https://drafts.csswg.org/css-shadow-1/#tree-scoped-name
     // If a tree-scoped name is global (such as @font-face names), then when a tree-scoped reference is dereferenced to
@@ -7009,13 +7021,12 @@ static bool is_exposed(Element const& element)
     return true;
 }
 
-// https://html.spec.whatwg.org/multipage/dom.html#dom-tree-accessors:supported-property-names
-Vector<FlyString> Document::supported_property_names() const
+Vector<Utf16FlyString> Document::supported_property_names() const
 {
     // The supported property names of a Document object document at any moment consist of the following,
     // in tree order according to the element that contributed them, ignoring later duplicates,
     // and with values from id attributes coming before values from name attributes when the same element contributes both:
-    OrderedHashTable<FlyString> names;
+    OrderedHashTable<Utf16FlyString> names;
 
     for (auto const& element : m_potentially_named_elements) {
         // - the value of the name content attribute for all exposed embed, form, iframe, img, and exposed object elements
@@ -7047,10 +7058,14 @@ Vector<FlyString> Document::supported_property_names() const
         }
     }
 
-    return names.values();
+    Vector<Utf16FlyString> result;
+    result.ensure_capacity(names.size());
+    for (auto const& name : names)
+        result.append(name);
+    return result;
 }
 
-static bool is_named_element_with_name(Element const& element, FlyString const& name)
+static bool is_named_element_with_name(Element const& element, Utf16FlyString const& name)
 {
     // Named elements with the name name, for the purposes of the above algorithm, are those that are either:
 
@@ -7081,7 +7096,7 @@ static bool is_named_element_with_name(Element const& element, FlyString const& 
     return false;
 }
 
-static Vector<GC::Ref<DOM::Element>> named_elements_with_name(Document const& document, FlyString const& name)
+static Vector<GC::Ref<DOM::Element>> named_elements_with_name(Document const& document, Utf16FlyString const& name)
 {
     Vector<GC::Ref<DOM::Element>> named_elements;
 
@@ -7094,7 +7109,7 @@ static Vector<GC::Ref<DOM::Element>> named_elements_with_name(Document const& do
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#dom-document-nameditem
-JS::Value Document::named_item_value(FlyString const& name) const
+JS::Value Document::named_item_value(Utf16FlyString const& name) const
 {
     // 1. Let elements be the list of named elements with the name name that are in a document tree with the Document as their root.
     // NOTE: There will be at least one such element, since the algorithm would otherwise not have been invoked by Web IDL.
@@ -7357,11 +7372,11 @@ Optional<String> Document::get_style_sheet_source(CSS::StyleSheetIdentifier cons
             if (auto* node = Node::from_unique_id(*identifier.dom_element_unique_id)) {
                 if (node->is_html_style_element()) {
                     if (auto* sheet = as<HTML::HTMLStyleElement>(*node).sheet())
-                        return sheet->source_text();
+                        return sheet->source_text().map([](auto const& source_text) { return source_text.to_utf8(); });
                 }
                 if (node->is_svg_style_element()) {
                     if (auto* sheet = as<SVG::SVGStyleElement>(*node).sheet())
-                        return sheet->source_text();
+                        return sheet->source_text().map([](auto const& source_text) { return source_text.to_utf8(); });
                 }
             }
         }
@@ -7376,7 +7391,7 @@ Optional<String> Document::get_style_sheet_source(CSS::StyleSheetIdentifier cons
         if (m_style_sheets) {
             for (auto& style_sheet : m_style_sheets->sheets()) {
                 if (auto match = find_style_sheet_with_url(identifier.url.value(), style_sheet); match.has_value())
-                    return match->source_text();
+                    return match->source_text().map([](auto const& source_text) { return source_text.to_utf8(); });
             }
         }
 
@@ -7387,7 +7402,7 @@ Optional<String> Document::get_style_sheet_source(CSS::StyleSheetIdentifier cons
                     return;
 
                 if (auto match = find_style_sheet_with_url(identifier.url.value(), style_sheet); match.has_value())
-                    result = match->source_text();
+                    result = match->source_text().map([](auto const& source_text) { return source_text.to_utf8(); });
             });
             return result;
         }
@@ -7585,7 +7600,7 @@ Vector<GC::Root<Range>> Document::find_matching_text(String const& query, CaseSe
 }
 
 // https://dom.spec.whatwg.org/#document-allow-declarative-shadow-roots
-bool Document::allow_declarative_shadow_roots() const
+HTML::HTMLParser::AllowDeclarativeShadowRoots Document::allow_declarative_shadow_roots() const
 {
     return m_allow_declarative_shadow_roots;
 }
@@ -7916,22 +7931,24 @@ void Document::unfullscreen_element(GC::Ref<Element> element)
 }
 
 // https://dom.spec.whatwg.org/#document-allow-declarative-shadow-roots
-void Document::set_allow_declarative_shadow_roots(bool allow)
+void Document::set_allow_declarative_shadow_roots(HTML::HTMLParser::AllowDeclarativeShadowRoots allow)
 {
     m_allow_declarative_shadow_roots = allow;
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#parse-html-from-a-string
-void Document::parse_html_from_a_string(StringView html)
+void Document::parse_html_from_a_string(Utf16View html)
 {
     // 1. Set document's type to "html".
     set_document_type(DOM::Document::Type::HTML);
 
-    // 2. Create an HTML parser parser, associated with document.
+    // 2. Let parser be a new HTML parser whose allow declarative shadow roots is document's allow declarative shadow roots,
+    //    associated with document.
     // 3. Place html into the input stream for parser. The encoding confidence is irrelevant.
     // FIXME: We don't have the concept of encoding confidence yet.
     auto scripting_mode = is_scripting_enabled() ? HTML::ParserScriptingMode::Normal : HTML::ParserScriptingMode::Disabled;
     auto parser = HTML::HTMLParser::create_for_decoded_string(*this, html, scripting_mode, "UTF-8"sv);
+    parser->set_allow_declarative_shadow_roots(allow_declarative_shadow_roots());
 
     // 4. Start parser and let it run until it has consumed all the characters just inserted into the input stream.
     parser->run(as<HTML::Window>(HTML::relevant_global_object(*this)).associated_document().url());
@@ -7957,16 +7974,16 @@ WebIDL::ExceptionOr<GC::Root<DOM::Document>> Document::parse_html_unsafe(JS::VM&
     document->set_content_type("text/html"_string);
 
     // 3. Set document's allow declarative shadow roots to true.
-    document->set_allow_declarative_shadow_roots(true);
+    document->set_allow_declarative_shadow_roots(HTML::HTMLParser::AllowDeclarativeShadowRoots::Yes);
 
     // 4. Parse HTML from a string given document and compliantHTML.
-    document->parse_html_from_a_string(compliant_html.to_utf8_but_should_be_ported_to_utf16());
+    document->parse_html_from_a_string(compliant_html.utf16_view());
 
     // AD-HOC: Setting the origin to match that of the associated document matches the behavior of existing browsers.
     auto& associated_document = as<HTML::Window>(realm.global_object()).associated_document();
     document->set_origin(associated_document.origin());
 
-    // 5. Return document.
+    // 4. Return document.
     return document;
 }
 
@@ -8370,14 +8387,14 @@ Optional<Painting::CaretPosition> Document::caret_position_from_point_for_select
     return hit_test_display_list->caret_position_from_point(position, *viewport_paintable, page().client().device_pixels_per_css_pixel(), page().chrome_metrics(), Painting::CaretPositionMode::SelectionStart);
 }
 
-Optional<Painting::CaretPosition> Document::caret_position_from_point_for_selection(CSSPixelPoint position)
+Optional<Painting::CaretPosition> Document::caret_position_from_point_for_selection(CSSPixelPoint position, Node const* constraint_scope)
 {
     auto hit_test_display_list = ensure_hit_test_display_list();
     auto viewport_paintable = paintable();
     if (!hit_test_display_list || !viewport_paintable)
         return {};
     viewport_paintable->refresh_scroll_state();
-    return hit_test_display_list->caret_position_from_point(position, *viewport_paintable, page().client().device_pixels_per_css_pixel(), page().chrome_metrics(), Painting::CaretPositionMode::Selection);
+    return hit_test_display_list->caret_position_from_point(position, *viewport_paintable, page().client().device_pixels_per_css_pixel(), page().chrome_metrics(), Painting::CaretPositionMode::Selection, constraint_scope);
 }
 
 TraversalDecision Document::hit_test_all(CSSPixelPoint position, Function<TraversalDecision(Painting::HitTestResult)> const& callback)
@@ -8484,16 +8501,18 @@ void Document::run_csp_initialization() const
 }
 
 // https://dom.spec.whatwg.org/#flatten-element-creation-options
-WebIDL::ExceptionOr<Document::RegistryAndIs> Document::flatten_element_creation_options(Variant<String, Bindings::ElementCreationOptions> const& options) const
+WebIDL::ExceptionOr<Document::RegistryAndIs> Document::flatten_element_creation_options(Variant<Utf16FlyString, Bindings::ElementCreationOptions> const& options) const
 {
     // 1. Let registry be the result of looking up a custom element registry given document.
     GC::Ptr<HTML::CustomElementRegistry> registry = HTML::look_up_a_custom_element_registry(*this);
 
     // 2. Let is be null.
-    Optional<String> is;
+    Optional<Utf16FlyString> is;
 
     // 3. If options is a dictionary:
-    if (auto* dictionary = options.get_pointer<Bindings::ElementCreationOptions>()) {
+    if (auto* legacy_is = options.get_pointer<Utf16FlyString>()) {
+        is = *legacy_is;
+    } else if (auto* dictionary = options.get_pointer<Bindings::ElementCreationOptions>()) {
         // 1. If options["is"] exists, then set is to it.
         if (dictionary->is.has_value())
             is = dictionary->is;
@@ -8686,12 +8705,13 @@ GC::Ptr<HTML::CustomElementRegistry> Document::effective_global_custom_element_r
 }
 
 // https://html.spec.whatwg.org/multipage/custom-elements.html#upgrade-particular-elements-within-a-document
-void Document::upgrade_particular_elements(GC::Ref<HTML::CustomElementRegistry> registry, GC::Ref<HTML::CustomElementDefinition> definition, String local_name, Optional<String> maybe_name)
+void Document::upgrade_particular_elements(GC::Ref<HTML::CustomElementRegistry> registry, GC::Ref<HTML::CustomElementDefinition> definition, Utf16FlyString local_name, Optional<Utf16FlyString> maybe_name)
 {
     // To upgrade particular elements within a document given a CustomElementRegistry object registry, a Document
     // object document, a custom element definition definition, a string localName, and optionally a string name
     // (default localName):
     auto name = maybe_name.value_or(local_name);
+    auto only_include_elements_with_matching_is_value = name != local_name;
 
     // 1. Let upgradeCandidates be all elements that are shadow-including descendants of document, whose custom element
     //    registry is registry, whose namespace is the HTML namespace, and whose local name is localName, in
@@ -8707,7 +8727,7 @@ void Document::upgrade_particular_elements(GC::Ref<HTML::CustomElementRegistry> 
             return TraversalDecision::Continue;
         }
 
-        if (name != local_name && element->is_value() != name)
+        if (only_include_elements_with_matching_is_value && (!element->is_value().has_value() || element->is_value().value() != name))
             return TraversalDecision::Continue;
 
         // 2. For each element element of upgradeCandidates:
@@ -8862,7 +8882,7 @@ Optional<Vector<CSS::Parser::ComponentValue>> Document::environment_variable_val
         if (!indices.is_empty())
             return invalid();
         return Vector {
-            CSS::Parser::ComponentValue { CSS::Parser::Token::create_dimension(0, "px"_fly_string) }
+            CSS::Parser::ComponentValue { CSS::Parser::Token::create_dimension(0, "px"_utf16_fly_string) }
         };
     case CSS::EnvironmentVariable::ViewportSegmentBottom:
     case CSS::EnvironmentVariable::ViewportSegmentHeight:
@@ -8940,6 +8960,14 @@ void Document::did_change_custom_property_registrations()
 
 void Document::build_registered_properties_cache()
 {
+    // The set of effective @property rules can only change when the active stylesheet rule set changes, which also
+    // invalidates the document's style cache. Skip the rebuild until that happens.
+    if (!m_needs_registered_properties_cache_update)
+        return;
+    m_needs_registered_properties_cache_update = false;
+
+    ++m_style_invalidation_counters.registered_properties_cache_rebuilds;
+
     HashMap<Utf16FlyString, CSS::CustomPropertyRegistration> cached_registered_properties_from_css_property_rules;
     for_each_active_css_style_sheet([&](CSS::CSSStyleSheet const& style_sheet) {
         style_sheet.for_each_effective_rule(TraversalOrder::Preorder, [&](CSS::CSSRule const& rule) {

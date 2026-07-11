@@ -71,7 +71,7 @@ private:
     Optional<PageClient const&> page(u64 index, SourceLocation = SourceLocation::current()) const;
 
     virtual Messages::WebContentServer::InitTransportResponse init_transport(int peer_pid) override;
-    virtual void initialize(u64 initial_page_id) override;
+    virtual void initialize(u64 initial_page_id, Web::HTML::NavigableId root_navigable_id, Web::HTML::NavigableIdAllocator navigable_id_allocator) override;
     virtual void close_server() override;
     virtual Messages::WebContentServer::GetWindowHandleResponse get_window_handle(u64 page_id) override;
     virtual void set_window_handle(u64 page_id, String handle) override;
@@ -92,9 +92,9 @@ private:
     virtual void load_html_with_url(u64 page_id, ByteString, URL::URL) override;
     virtual void reload(u64 page_id) override;
     virtual void cancel_download(u64 page_id, u64 download_id) override;
-    virtual void run_iframe_load_event_steps(u64 page_id, String frame_id) override;
+    virtual void run_iframe_load_event_steps(u64 page_id, Web::HTML::NavigableId frame_id) override;
     virtual void set_page_parent_context(u64 page_id, Optional<Web::Compositor::CompositorContextId>) override;
-    virtual void set_remote_child_frame_compositor_context(u64 page_id, String frame_id, Optional<Web::Compositor::CompositorContextId>) override;
+    virtual void set_remote_child_frame_compositor_context(u64 page_id, Web::HTML::NavigableId frame_id, Optional<Web::Compositor::CompositorContextId>) override;
     virtual void traverse_the_history_to_step(u64 page_id, i32 step) override;
     virtual void check_if_traverse_history_step_is_canceled(u64 page_id, u64 request_id, i32 step) override;
     virtual void set_top_level_session_history(u64 page_id, Vector<Web::HTML::SessionHistoryEntryDescriptor>, size_t current_top_level_entry_index, bool allow_reconstructing_current_entry) override;
@@ -143,9 +143,9 @@ private:
     virtual void get_dom_node_outer_html(u64 page_id, Web::UniqueNodeID node_id) override;
     virtual void set_dom_node_outer_html(u64 page_id, Web::UniqueNodeID node_id, String html) override;
     virtual void set_dom_node_text(u64 page_id, Web::UniqueNodeID node_id, String text) override;
-    virtual void set_dom_node_tag(u64 page_id, Web::UniqueNodeID node_id, String name) override;
+    virtual void set_dom_node_tag(u64 page_id, Web::UniqueNodeID node_id, Utf16FlyString name) override;
     virtual void add_dom_node_attributes(u64 page_id, Web::UniqueNodeID node_id, Vector<WebView::Attribute> attributes) override;
-    virtual void replace_dom_node_attribute(u64 page_id, Web::UniqueNodeID node_id, String name, Vector<WebView::Attribute> replacement_attributes) override;
+    virtual void replace_dom_node_attribute(u64 page_id, Web::UniqueNodeID node_id, Utf16FlyString name, Vector<WebView::Attribute> replacement_attributes) override;
     virtual void create_child_element(u64 page_id, Web::UniqueNodeID node_id) override;
     virtual void create_child_text_node(u64 page_id, Web::UniqueNodeID node_id) override;
     virtual void insert_dom_node_before(u64 page_id, Web::UniqueNodeID node_id, Web::UniqueNodeID parent_node_id, Optional<Web::UniqueNodeID> sibling_node_id) override;
@@ -191,7 +191,7 @@ private:
     virtual void toggle_media_fullscreen_state(u64 page_id) override;
     virtual void toggle_media_controls_state(u64 page_id) override;
 
-    virtual void toggle_page_mute_state(u64 page_id) override;
+    virtual void set_page_mute_state(u64 page_id, Web::HTML::MuteState mute_state) override;
 
     virtual void set_user_style(u64 page_id, String) override;
 
@@ -201,6 +201,8 @@ private:
     virtual void request_internal_page_info(u64 page_id, WebView::PageInfoType) override;
 
     virtual Messages::WebContentServer::GetSelectedTextResponse get_selected_text(u64 page_id) override;
+    virtual Messages::WebContentServer::GetSelectedTextForLookupResponse get_selected_text_for_lookup(u64 page_id) override;
+    virtual Messages::WebContentServer::SelectWordForDictionaryLookupResponse select_word_for_dictionary_lookup(u64 page_id, Web::DevicePixelPoint position) override;
     virtual Messages::WebContentServer::CutSelectedTextResponse cut_selected_text(u64 page_id) override;
     virtual void select_all(u64 page_id) override;
 
@@ -214,6 +216,7 @@ private:
     virtual void unmark_text_from_input_method(u64 page_id) override;
 
     virtual void system_time_zone_changed() override;
+    virtual void set_system_font_family(String family) override;
 
     virtual void set_document_cookie_version_buffer(u64 page_id, Core::AnonymousBuffer document_cookie_version_buffer) override;
     virtual void set_document_cookie_version_index(u64 page_id, i64 document_id, Core::SharedVersionIndex document_index) override;

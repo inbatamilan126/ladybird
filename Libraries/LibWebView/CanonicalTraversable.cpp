@@ -5,47 +5,47 @@
  */
 
 #include <LibWebView/CanonicalTraversable.h>
-#include <LibWebView/SiteIsolation.h>
+#include <LibWebView/SiteIsolationManager.h>
 #include <LibWebView/WebContentClient.h>
 
 namespace WebView {
 
 CanonicalTraversable::CanonicalTraversable()
-    : CanonicalNavigable(String {}, String {}, nullptr, 0)
+    : CanonicalNavigable({}, {}, nullptr, 0)
 {
 }
 
-CanonicalNavigable& CanonicalTraversable::insert(WebContentClient& reporting_client, u64 page_id, String parent_frame_id, String frame_id, CanonicalNavigable& fallback_parent)
+CanonicalNavigable& CanonicalTraversable::insert(WebContentClient& reporting_client, u64 page_id, Web::HTML::NavigableId parent_frame_id, Web::HTML::NavigableId frame_id, CanonicalNavigable& fallback_parent)
 {
-    if (auto existing_navigable = find(page_id, frame_id); existing_navigable.has_value())
+    if (auto existing_navigable = find(frame_id); existing_navigable.has_value())
         remove(*existing_navigable);
 
-    auto navigable = make<CanonicalNavigable>(move(frame_id), move(parent_frame_id), &reporting_client, page_id);
+    auto navigable = make<CanonicalNavigable>(frame_id, parent_frame_id, &reporting_client, page_id);
 
     // A frame's parent frame is always created (and thus reported) before the frame
     // itself, so if the parent is not in the index, the parent is the top-level document
     // of the reporting page: the fallback parent.
     auto* parent = &fallback_parent;
-    if (auto indexed_parent = find(page_id, navigable->parent_id()); indexed_parent.has_value())
+    if (auto indexed_parent = find(parent_frame_id); indexed_parent.has_value())
         parent = &*indexed_parent;
 
     auto& navigable_ref = parent->append_child(move(navigable));
-    m_navigable_index.set(NavigableKey { page_id, navigable_ref.id() }, navigable_ref.make_weak_ptr());
+    m_navigable_index.set(navigable_ref.id(), navigable_ref.make_weak_ptr());
     return navigable_ref;
 }
 
-Optional<CanonicalNavigable&> CanonicalTraversable::find(u64 page_id, StringView frame_id)
+Optional<CanonicalNavigable&> CanonicalTraversable::find(Web::HTML::NavigableId frame_id)
 {
-    auto navigable = m_navigable_index.get(NavigableKey { page_id, MUST(String::from_utf8(frame_id)) });
+    auto navigable = m_navigable_index.get(frame_id);
     if (!navigable.has_value() || !navigable.value())
         return {};
 
     return *navigable.value();
 }
 
-Optional<CanonicalNavigable const&> CanonicalTraversable::find(u64 page_id, StringView frame_id) const
+Optional<CanonicalNavigable const&> CanonicalTraversable::find(Web::HTML::NavigableId frame_id) const
 {
-    auto navigable = m_navigable_index.get(NavigableKey { page_id, MUST(String::from_utf8(frame_id)) });
+    auto navigable = m_navigable_index.get(frame_id);
     if (!navigable.has_value() || !navigable.value())
         return {};
 
@@ -65,7 +65,7 @@ void CanonicalTraversable::remove(CanonicalNavigable& navigable)
 void CanonicalTraversable::remove_from_index(CanonicalNavigable& navigable)
 {
     navigable.for_each_in_inclusive_subtree([&](CanonicalNavigable& child) {
-        m_navigable_index.remove(NavigableKey { child.reporting_page_id(), child.id() });
+        m_navigable_index.remove(child.id());
         return IterationDecision::Continue;
     });
 }
@@ -516,7 +516,11 @@ HistoryTraversalDecision CanonicalTraversable::traverse_the_history_by_delta(int
     if (!target.has_value())
         return { .outcome = { .status = HistoryTraversalStatus::NoEntry } };
 
-    auto will_replace_web_content_process = !is_url_suitable_for_same_process_navigation(current_url, target->target_top_level_entry->url);
+    // FIXME: This pre-flight prediction exists only because WebContent applies the history step itself, so the UI must
+    //        choose between delegating the traversal to the current process and driving a cross-process load before
+    //        sending anything. Once the UI process owns apply-the-history-step and issues per-navigable load commands,
+    //        placement is decided per command and this prediction goes away.
+    auto will_replace_web_content_process = SiteIsolationManager::the().navigation_requires_process_swap(current_url, target->target_top_level_entry->url);
     auto pending_traversal = PendingSessionHistoryTraversal {
         .target_step = target->target_step,
         .target_step_index = target->target_step_index,
@@ -582,7 +586,7 @@ URL::URL CanonicalTraversable::prepare_to_load_session_history_traversal_target_
             .target_step = target.target_step,
             .target_step_index = target.target_step_index,
             .will_change_top_level_entry = target.changes_top_level_entry,
-            .will_replace_web_content_process = !is_url_suitable_for_same_process_navigation(current_url, target.target_top_level_entry->url),
+            .will_replace_web_content_process = SiteIsolationManager::the().navigation_requires_process_swap(current_url, target.target_top_level_entry->url),
             .stage = PendingSessionHistoryTraversal::Stage::LoadingEntryFromUIProcess,
             .on_cancelation_check_complete = nullptr,
         };

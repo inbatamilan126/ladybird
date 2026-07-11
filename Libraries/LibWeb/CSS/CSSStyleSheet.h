@@ -11,6 +11,7 @@
 #include <AK/Function.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/RefPtr.h>
+#include <AK/Utf16View.h>
 #include <LibWeb/Bindings/CSSStyleSheet.h>
 #include <LibWeb/CSS/CSSNamespaceRule.h>
 #include <LibWeb/CSS/CSSRule.h>
@@ -101,11 +102,11 @@ public:
     NonnullRefPtr<StyleCache> shared_single_constructed_sheet_style_cache();
     SelectorInsights const& selector_insights() const;
 
-    Optional<FlyString> default_namespace() const;
+    Optional<Utf16FlyString> default_namespace() const;
     GC::Ptr<CSSNamespaceRule> default_namespace_rule() const { return m_default_namespace_rule; }
-    HashTable<FlyString> declared_namespaces() const;
+    HashTable<Utf16FlyString> declared_namespaces() const;
 
-    Optional<FlyString> namespace_uri(StringView namespace_prefix) const;
+    Optional<Utf16FlyString> namespace_uri(Utf16View namespace_prefix) const;
 
     Vector<GC::Ref<CSSImportRule>> const& import_rules() const { return m_import_rules; }
 
@@ -122,8 +123,8 @@ public:
 
     bool disallow_modification() const { return m_disallow_modification; }
 
-    void set_source_text(String source) { m_source_text = move(source); }
-    Optional<String> source_text() const { return m_source_text; }
+    void set_source_text(Utf16String source) { m_source_text = move(source); }
+    Optional<Utf16String> source_text() const { return m_source_text; }
 
     void add_critical_subresource(Subresource&);
     void remove_critical_subresource(Subresource&);
@@ -145,11 +146,11 @@ private:
 
     Parser::ParsingParams make_parsing_params() const;
 
-    Optional<String> m_source_text;
+    Optional<Utf16String> m_source_text;
 
     GC::Ptr<CSSRuleList> m_rules;
     GC::Ptr<CSSNamespaceRule> m_default_namespace_rule;
-    HashMap<FlyString, GC::Ptr<CSSNamespaceRule>> m_namespace_rules;
+    HashMap<Utf16FlyString, GC::Ptr<CSSNamespaceRule>> m_namespace_rules;
     Vector<GC::Ref<CSSImportRule>> m_import_rules;
 
     GC::Ptr<CSSRule> m_owner_css_rule;

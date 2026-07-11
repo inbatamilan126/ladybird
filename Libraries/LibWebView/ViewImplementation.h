@@ -41,11 +41,13 @@
 #include <LibWeb/HTML/SelectItem.h>
 #include <LibWeb/Page/EventResult.h>
 #include <LibWeb/Page/InputEvent.h>
+#include <LibWeb/Page/ScreenWakeLockHandle.h>
 #include <LibWeb/Page/ViewportIsFullscreen.h>
 #include <LibWeb/WebDriver/Response.h>
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/DOMNodeProperties.h>
+#include <LibWebView/DictionaryLookup.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/PageInfo.h>
 #include <LibWebView/PrivateBrowsing.h>
@@ -77,10 +79,10 @@ public:
     void set_url(Badge<WebContentClient>, URL::URL url) { set_url(move(url)); }
     URL::URL const& url() const { return m_url; }
 
-    void set_title(Badge<WebContentClient>, Utf16String title) { m_title = move(title); }
+    void set_title(Badge<WebContentClient>, Utf16String title);
     Utf16String const& title() const { return m_title; }
 
-    void set_favicon(Badge<WebContentClient>, Gfx::Bitmap const&);
+    void set_favicon(Badge<WebContentClient>, Optional<Gfx::Bitmap const&>);
     Optional<String> const& favicon_base64_png() const { return m_favicon_base64_png; }
 
     String const& handle() const { return m_client_state.client_handle; }
@@ -100,6 +102,8 @@ public:
     void load_navigation_error_page(StringView);
 
     void reload();
+    bool is_loading() const { return m_is_loading; }
+
     struct SessionHistoryTraversalMenuItem {
         int delta { 0 };
         String title;
@@ -150,6 +154,8 @@ public:
     ByteString selected_text();
     ByteString cut_selected_text();
     Optional<String> selected_text_with_whitespace_collapsed();
+    Optional<DictionaryLookup> selected_text_for_dictionary_lookup();
+    bool look_up_selected_text_at(Gfx::IntPoint widget_position);
     void select_all();
     void find_in_page(String const& query, CaseSensitivity = CaseSensitivity::CaseInsensitive);
     void find_in_page_next_match();
@@ -196,9 +202,9 @@ public:
     void get_dom_node_outer_html(Web::UniqueNodeID node_id);
     void set_dom_node_outer_html(Web::UniqueNodeID node_id, String const& html);
     void set_dom_node_text(Web::UniqueNodeID node_id, String const& text);
-    void set_dom_node_tag(Web::UniqueNodeID node_id, String const& name);
+    void set_dom_node_tag(Web::UniqueNodeID node_id, Utf16FlyString const& name);
     void add_dom_node_attributes(Web::UniqueNodeID node_id, ReadonlySpan<Attribute> attributes);
-    void replace_dom_node_attribute(Web::UniqueNodeID node_id, String const& name, ReadonlySpan<Attribute> replacement_attributes);
+    void replace_dom_node_attribute(Web::UniqueNodeID node_id, Utf16FlyString const& name, ReadonlySpan<Attribute> replacement_attributes);
     void create_child_element(Web::UniqueNodeID node_id);
     void create_child_text_node(Web::UniqueNodeID node_id);
     void insert_dom_node_before(Web::UniqueNodeID node_id, Web::UniqueNodeID parent_node_id, Optional<Web::UniqueNodeID> sibling_node_id);
@@ -251,6 +257,8 @@ public:
 
     void did_change_audio_play_state(Badge<WebContentClient>, Web::HTML::AudioPlayState);
     Web::HTML::AudioPlayState audio_play_state() const { return m_audio_play_state; }
+    void did_change_screen_wake_lock_state(Badge<WebContentClient>, Web::ScreenWakeLockState);
+    Web::ScreenWakeLockState screen_wake_lock_state() const { return m_screen_wake_lock_state; }
 
     void did_update_session_history(Badge<WebContentClient>, Vector<Web::HTML::SessionHistoryEntryDescriptor>, Vector<i32>, size_t current_used_step_index);
     void did_update_session_history_for_testing(Badge<WebContentClient>, Vector<Web::HTML::SessionHistoryEntryDescriptor>, Vector<i32>, size_t current_used_step_index);
@@ -289,6 +297,13 @@ public:
     Function<void()> prepare_for_immediate_close();
     bool needs_beforeunload_check() const { return m_needs_beforeunload_check; }
 
+    struct NavigationListener {
+        Function<void(URL::URL const&)> on_load_start;
+        Function<void(URL::URL const&)> on_load_finish;
+    };
+    u64 add_navigation_listener(NavigationListener);
+    void remove_navigation_listener(u64 listener_id);
+
     Function<void()> on_ready_to_paint;
     Function<String(Web::HTML::ActivateTab, Web::HTML::WebViewHints, Optional<u64>)> on_new_web_view;
     Function<void()> on_activate_tab;
@@ -297,18 +312,12 @@ public:
     Function<void()> on_link_unhover;
     Function<void(Utf16String const&)> on_title_change;
     Function<void(URL::URL const&)> on_url_change;
-    Function<void(URL::URL const&, bool)> on_load_start;
+    Function<void()> on_load_start;
     Function<void(URL::URL const&)> on_load_finish;
-
-    struct NavigationListener {
-        Function<void(URL::URL const&, bool)> on_load_start;
-        Function<void(URL::URL const&)> on_load_finish;
-    };
-    u64 add_navigation_listener(NavigationListener);
-    void remove_navigation_listener(u64 listener_id);
-
+    Function<void(bool)> on_loading_state_change;
     Function<void(ByteString const& path, i32)> on_request_file;
-    Function<void(Gfx::Bitmap const&)> on_favicon_change;
+    Function<void(DictionaryLookup const&, Gfx::IntPoint)> on_request_dictionary_lookup;
+    Function<void(Optional<Gfx::Bitmap const&>)> on_favicon_change;
     Function<void(Gfx::Cursor const&)> on_cursor_change;
     Function<void(Gfx::IntPoint, ByteString const&)> on_request_tooltip_override;
     Function<void()> on_stop_tooltip_override;
@@ -363,13 +372,19 @@ public:
     Function<void(Gfx::Color)> on_theme_color_change;
     Function<void(Gfx::Color)> on_page_background_color_change;
     Function<void(Web::HTML::AudioPlayState)> on_audio_play_state_changed;
+    Function<void(Web::ScreenWakeLockState)> on_screen_wake_lock_state_changed;
     Function<void()> on_web_content_crashed;
     Function<void()> on_web_content_process_change_for_cross_site_navigation;
 
     Menu& page_context_menu() { return *m_page_context_menu; }
     Menu& link_context_menu() { return *m_link_context_menu; }
+    Menu& selected_text_link_context_menu() { return *m_selected_text_link_context_menu; }
     Menu& image_context_menu() { return *m_image_context_menu; }
     Menu& media_context_menu() { return *m_media_context_menu; }
+
+    Menu& bookmarks_bar_context_menu() { return *m_bookmarks_bar_context_menu; }
+    Menu& bookmark_context_menu() { return *m_bookmark_context_menu; }
+    Menu& bookmark_folder_context_menu() { return *m_bookmark_folder_context_menu; }
 
     void did_request_page_context_menu(Badge<WebContentClient>, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target);
     void did_request_link_context_menu(Badge<WebContentClient>, Gfx::IntPoint content_position, URL::URL url);
@@ -393,7 +408,7 @@ protected:
     static constexpr auto ZOOM_MAX_LEVEL = 5.0;
     static constexpr auto ZOOM_STEP = 0.1;
 
-    ViewImplementation();
+    explicit ViewImplementation(IsPrivate = IsPrivate::No);
 
     u64 page_id() const;
 
@@ -401,6 +416,7 @@ protected:
     void did_start_navigation(URL::URL const&, Variant<Empty, String, Web::HTML::POSTResource>, bool is_redirect, Web::Bindings::NavigationHistoryBehavior);
     bool did_cancel_navigation(URL::URL const&);
     void did_finish_navigation(URL::URL const&);
+    void set_loading_state(bool);
     void complete_webdriver_navigation_completion(u64 request_id, Web::WebDriver::Response);
     void complete_webdriver_pending_navigation_if_url_matches(URL::URL const&);
     void update_navigation_action_state();
@@ -436,6 +452,7 @@ protected:
         Yes,
     };
     virtual void initialize_client(CreateNewClient = CreateNewClient::Yes);
+    void reset_page_media_state();
 
     enum class LoadErrorPage {
         No,
@@ -454,6 +471,7 @@ protected:
     void update_bookmark_action();
 
     void initialize_context_menus();
+    void update_look_up_selected_text_action(Optional<DictionaryLookup> const& lookup, Gfx::IntPoint content_position);
     enum class PromptForPath : u8 {
         No,
         Yes,
@@ -489,8 +507,13 @@ protected:
 
     RefPtr<Menu> m_page_context_menu;
     RefPtr<Menu> m_link_context_menu;
+    RefPtr<Menu> m_selected_text_link_context_menu;
     RefPtr<Menu> m_image_context_menu;
     RefPtr<Menu> m_media_context_menu;
+
+    RefPtr<Menu> m_bookmarks_bar_context_menu;
+    RefPtr<Menu> m_bookmark_context_menu;
+    RefPtr<Menu> m_bookmark_folder_context_menu;
 
     RefPtr<Action> m_navigate_back_action;
     RefPtr<Action> m_navigate_forward_action;
@@ -498,6 +521,10 @@ protected:
     RefPtr<Action> m_toggle_bookmark_action;
 
     RefPtr<Action> m_reset_zoom_action;
+
+    RefPtr<Action> m_look_up_selected_text_action;
+    Optional<DictionaryLookup> m_look_up;
+    Gfx::IntPoint m_look_up_position;
 
     RefPtr<Action> m_search_selected_text_action;
     Optional<String> m_search_text;
@@ -507,6 +534,7 @@ protected:
 
     RefPtr<Action> m_open_in_new_tab_action;
     RefPtr<Action> m_open_in_new_window_action;
+    RefPtr<Action> m_open_in_new_private_window_action;
     RefPtr<Action> m_download_linked_file_action;
     RefPtr<Action> m_download_linked_file_as_action;
     RefPtr<Action> m_copy_url_action;
@@ -541,6 +569,10 @@ protected:
 
     bool m_should_suppress_history_for_current_load { false };
     bool m_should_suppress_history_for_next_load { false };
+    bool m_is_loading { false };
+    bool m_is_waiting_for_navigation_start { false };
+    Optional<String> m_loading_navigation_id;
+
     size_t m_crash_count = 0;
     RefPtr<Core::Timer> m_repeated_crash_timer;
 
@@ -549,6 +581,7 @@ protected:
 
     Web::HTML::AudioPlayState m_audio_play_state { Web::HTML::AudioPlayState::Paused };
     size_t m_number_of_elements_playing_audio { 0 };
+    Web::ScreenWakeLockState m_screen_wake_lock_state { Web::ScreenWakeLockState::Released };
 
     Web::HTML::MuteState m_mute_state { Web::HTML::MuteState::Unmuted };
 

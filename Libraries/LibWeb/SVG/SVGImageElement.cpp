@@ -56,30 +56,30 @@ void SVGImageElement::adopted_from(DOM::Document& old_document)
         m_load_event_delayer.emplace(document());
 }
 
-void SVGImageElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void SVGImageElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
     if (name == SVG::AttributeNames::x) {
-        m_x = AttributeParser::parse_number_percentage(value.value_or(String {}));
+        m_x = AttributeParser::parse_number_percentage(value.value_or({}));
     } else if (name == SVG::AttributeNames::y) {
-        m_y = AttributeParser::parse_number_percentage(value.value_or(String {}));
+        m_y = AttributeParser::parse_number_percentage(value.value_or({}));
     } else if (name == SVG::AttributeNames::width) {
-        m_width = AttributeParser::parse_number_percentage(value.value_or(String {}));
+        m_width = AttributeParser::parse_number_percentage(value.value_or({}));
     } else if (name == SVG::AttributeNames::height) {
-        m_height = AttributeParser::parse_number_percentage(value.value_or(String {}));
+        m_height = AttributeParser::parse_number_percentage(value.value_or({}));
     } else if (name == SVG::AttributeNames::href) {
         // https://svgwg.org/svg2-draft/linking.html#XLinkRefAttrs
         // For backwards compatibility, elements with an ‘href’ attribute also recognize an ‘href’ attribute in the
         // XLink namespace. If the element is in the XLink namespace, it does not recognize an ‘href’ attribute in the
         // SVG namespace. When the ‘href’ attribute is present in both the XLink namespace and without a namespace, the
         // value of the attribute without a namespace shall be used. The attribute in the XLink namespace shall be ignored.
-        if (namespace_ == Namespace::XLink && has_attribute_ns({}, name))
+        if (namespace_ == Namespace::XLink && has_attribute_ns(Optional<Utf16FlyString> {}, name))
             return;
 
         auto href = value;
         if (!namespace_.has_value() && !href.has_value())
-            href = get_attribute_ns(SVG::AttributeNames::href, Namespace::XLink);
+            href = get_attribute_ns(Namespace::XLink, SVG::AttributeNames::href);
 
         process_the_url(href);
     }
@@ -160,7 +160,7 @@ Gfx::FloatRect SVGImageElement::bounding_box(CSSPixelSize viewport_size) const
 }
 
 // https://www.w3.org/TR/SVG2/linking.html#processingURL
-void SVGImageElement::process_the_url(Optional<String> const& href)
+void SVGImageElement::process_the_url(Optional<Utf16String> const& href)
 {
     if (!href.has_value()) {
         m_href = {};

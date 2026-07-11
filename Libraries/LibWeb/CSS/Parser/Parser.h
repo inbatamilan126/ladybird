@@ -10,6 +10,7 @@
 #include <AK/Error.h>
 #include <AK/NonnullRawPtr.h>
 #include <AK/RefPtr.h>
+#include <AK/Utf16String.h>
 #include <AK/Vector.h>
 #include <LibGC/Ptr.h>
 #include <LibGfx/Font/UnicodeRange.h>
@@ -39,6 +40,8 @@
 
 namespace Web::CSS::Parser {
 
+Optional<FeatureComparison> parse_feature_comparison(TokenStream<ComponentValue>&);
+
 namespace CalcParsing {
 
 struct Operator {
@@ -65,7 +68,7 @@ struct NegateNode {
 }
 
 struct FunctionContext {
-    StringView name;
+    Utf16FlyString name;
 };
 
 struct RelativeColorParseContext {
@@ -109,11 +112,11 @@ struct WEB_API ParsingParams {
 
     Vector<ValueParsingContext> value_context;
     Vector<RuleContext> rule_context;
-    HashTable<FlyString> declared_namespaces;
+    HashTable<Utf16FlyString> declared_namespaces;
 };
 
 struct DevToolsStyleDeclaration {
-    FlyString name;
+    Utf16FlyString name;
     String value;
     Important important { Important::No };
     bool is_custom_property { false };
@@ -122,6 +125,7 @@ struct DevToolsStyleDeclaration {
 };
 
 WEB_API Vector<DevToolsStyleDeclaration> parse_css_declaration_block_for_devtools(ParsingParams const&, StringView);
+WEB_API Vector<DevToolsStyleDeclaration> parse_css_declaration_block_for_devtools(ParsingParams const&, Utf16View);
 
 // The very large CSS Parser implementation code is broken up among several .cpp files:
 // Parser.cpp contains the core parser algorithms, defined in https://drafts.csswg.org/css-syntax
@@ -132,6 +136,7 @@ class Parser {
 
 public:
     static Parser create(ParsingParams const&, StringView input, StringView encoding = "utf-8"sv);
+    static Parser create(ParsingParams const&, Utf16View input);
 
     GC::RootVector<GC::Ref<CSSRule>> convert_rules(Vector<Rule> const& raw_rules);
     GC::Ref<CSS::CSSStyleSheet> parse_as_css_stylesheet(Optional<::URL::URL> location, GC::Ptr<MediaList> = {});
@@ -170,6 +175,7 @@ public:
     RefPtr<StyleValue const> parse_as_css_value(PropertyID);
     RefPtr<StyleValue const> parse_as_descriptor_value(AtRuleID, DescriptorNameAndID const&);
     RefPtr<StyleValue const> parse_as_type(ValueType);
+    RefPtr<StyleValue const> parse_entirely_as_type(ValueType);
 
     Optional<ComponentValue> parse_as_component_value();
 
@@ -303,10 +309,10 @@ private:
         Yes,
     };
     Optional<FlyString> parse_layer_name(TokenStream<ComponentValue>&, AllowBlankLayerName);
-    Optional<Vector<FlyString>> parse_comma_separated_family_name_list(TokenStream<ComponentValue>&);
+    Optional<Vector<Utf16FlyString>> parse_comma_separated_family_name_list(TokenStream<ComponentValue>&);
 
     struct FunctionPrelude {
-        FlyString name;
+        Utf16FlyString name;
         Vector<FunctionParameterInternal> parameters;
         NonnullRefPtr<SyntaxNode> return_type;
     };
@@ -413,9 +419,9 @@ private:
     };
     Optional<PropertyAndValue> parse_css_value_for_properties(ReadonlySpan<PropertyID>, TokenStream<ComponentValue>&);
     RefPtr<StyleValue const> parse_builtin_value(TokenStream<ComponentValue>&);
-    Optional<FlyString> parse_custom_ident(TokenStream<ComponentValue>&, ReadonlySpan<StringView> blacklist);
+    Optional<Utf16FlyString> parse_custom_ident(TokenStream<ComponentValue>&, ReadonlySpan<StringView> blacklist);
     RefPtr<CustomIdentStyleValue const> parse_custom_ident_value(TokenStream<ComponentValue>&, ReadonlySpan<StringView> blacklist = {});
-    Optional<FlyString> parse_dashed_ident(TokenStream<ComponentValue>&);
+    Optional<Utf16FlyString> parse_dashed_ident(TokenStream<ComponentValue>&);
     RefPtr<CustomIdentStyleValue const> parse_dashed_ident_value(TokenStream<ComponentValue>&);
     RefPtr<RandomValueSharingStyleValue const> parse_random_value_sharing(TokenStream<ComponentValue>&);
     // NOTE: Implemented in generated code. (GenerateCSSMathFunctions.cpp)
@@ -448,7 +454,7 @@ private:
     RefPtr<StyleValue const> parse_color_scheme_value(TokenStream<ComponentValue>&);
     RefPtr<StyleValue const> parse_corner_shape_value(TokenStream<ComponentValue>&);
     RefPtr<StyleValue const> parse_counter_value(TokenStream<ComponentValue>&);
-    Optional<FlyString> parse_counter_style_name(TokenStream<ComponentValue>&);
+    Optional<Utf16FlyString> parse_counter_style_name(TokenStream<ComponentValue>&);
     RefPtr<StyleValue const> parse_counter_style_value(TokenStream<ComponentValue>&);
     RefPtr<StyleValue const> parse_nonnegative_integer_symbol_pair_value(TokenStream<ComponentValue>&);
     enum class AllowReversed {
@@ -649,7 +655,7 @@ private:
 
     RefPtr<StyleValue const> parse_according_to_syntax_node(TokenStream<ComponentValue>& tokens, SyntaxNode const& syntax_node);
 
-    static bool has_ignored_vendor_prefix(StringView);
+    static bool has_ignored_vendor_prefix(Utf16View);
 
     void extract_property(Declaration const&, Parser::PropertiesAndCustomProperties&);
 
@@ -698,10 +704,10 @@ private:
     bool context_allows_quirky_length() const;
     bool context_allows_tree_counting_functions() const;
     bool context_allows_random_functions() const;
-    FlyString random_value_sharing_auto_name() const;
+    Utf16FlyString random_value_sharing_auto_name() const;
 
     Vector<RuleContext> m_rule_context;
-    HashTable<FlyString> m_declared_namespaces;
+    HashTable<Utf16FlyString> m_declared_namespaces;
 
     Vector<PseudoClass> m_pseudo_class_context; // Stack of pseudo-class functions we're currently inside
 };
@@ -711,10 +717,14 @@ private:
 namespace Web {
 
 GC::Ref<CSS::CSSStyleSheet> parse_css_stylesheet(CSS::Parser::ParsingParams const&, StringView, Optional<::URL::URL> location = {}, GC::Ptr<CSS::MediaList> media_list = {});
+GC::Ref<CSS::CSSStyleSheet> parse_css_stylesheet(CSS::Parser::ParsingParams const&, Utf16View, Optional<::URL::URL> location = {}, GC::Ptr<CSS::MediaList> media_list = {});
 CSS::Parser::Parser::PropertiesAndCustomProperties parse_css_property_declaration_block(CSS::Parser::ParsingParams const&, StringView);
+CSS::Parser::Parser::PropertiesAndCustomProperties parse_css_property_declaration_block(CSS::Parser::ParsingParams const&, Utf16View);
 Vector<CSS::Descriptor> parse_css_descriptor_declaration_block(CSS::Parser::ParsingParams const&, CSS::AtRuleID, StringView);
 RefPtr<CSS::StyleValue const> parse_css_value(CSS::Parser::ParsingParams const&, StringView, CSS::PropertyID);
+RefPtr<CSS::StyleValue const> parse_css_value(CSS::Parser::ParsingParams const&, Utf16View, CSS::PropertyID);
 RefPtr<CSS::StyleValue const> parse_css_type(CSS::Parser::ParsingParams const&, StringView, CSS::ValueType);
+RefPtr<CSS::StyleValue const> parse_css_type(CSS::Parser::ParsingParams const&, Utf16View, CSS::ValueType);
 RefPtr<CSS::StyleValue const> parse_css_descriptor(CSS::Parser::ParsingParams const&, CSS::AtRuleID, CSS::DescriptorNameAndID const&, StringView);
 Optional<CSS::SelectorList> parse_selector(CSS::Parser::ParsingParams const&, StringView);
 Optional<CSS::SelectorList> parse_selector_for_nested_style_rule(CSS::Parser::ParsingParams const&, StringView, CSS::StyleNestingParent);
@@ -722,11 +732,14 @@ Optional<CSS::PageSelectorList> parse_page_selector_list(CSS::Parser::ParsingPar
 Optional<CSS::Selector::PseudoElementSelector> parse_pseudo_element_selector(CSS::Parser::ParsingParams const&, StringView);
 CSS::CSSRule* parse_css_rule(CSS::Parser::ParsingParams const&, StringView, bool nested = false);
 RefPtr<CSS::MediaQuery> parse_media_query(CSS::Parser::ParsingParams const&, StringView);
+RefPtr<CSS::MediaQuery> parse_media_query(CSS::Parser::ParsingParams const&, Utf16View);
 Vector<NonnullRefPtr<CSS::MediaQuery>> parse_media_query_list(CSS::Parser::ParsingParams const&, StringView);
+Vector<NonnullRefPtr<CSS::MediaQuery>> parse_media_query_list(CSS::Parser::ParsingParams const&, Utf16View);
 RefPtr<CSS::Supports> parse_css_supports(CSS::Parser::ParsingParams const&, StringView);
 Vector<CSS::Parser::ComponentValue> parse_component_values_list(CSS::Parser::ParsingParams const&, StringView);
+Vector<CSS::Parser::ComponentValue> parse_component_values_list(CSS::Parser::ParsingParams const&, Utf16View);
 GC::Ref<JS::Realm> internal_css_realm();
 ErrorOr<String> css_decode_bytes(Optional<StringView> const& environment_encoding, Optional<String> mime_type_charset, ReadonlyBytes encoded_string);
-bool is_valid_custom_ident(FlyString const&, ReadonlySpan<StringView> const& blacklist);
+bool is_valid_custom_ident(Utf16View, ReadonlySpan<StringView> const& blacklist);
 
 }

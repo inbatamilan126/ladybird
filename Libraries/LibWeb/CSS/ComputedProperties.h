@@ -93,6 +93,7 @@ public:
         void set_property_inherited(PropertyID, Inherited);
         void set_depends_on_viewport_metrics();
         void set_font_metrics_depend_on_viewport_metrics();
+        void set_in_display_none_subtree();
         void set_has_pseudo_element_style(PseudoElement);
 
         void set_property(PropertyID, NonnullRefPtr<StyleValue const> value, Inherited = Inherited::No, Important = Important::No);
@@ -118,6 +119,7 @@ public:
         NonnullRefPtr<ComputedProperties> m_style;
         bool m_depends_on_viewport_metrics { false };
         bool m_font_metrics_depend_on_viewport_metrics { false };
+        bool m_in_display_none_subtree { false };
     };
 
     static NonnullRefPtr<ComputedProperties> create(Builder&&);
@@ -133,7 +135,7 @@ public:
         }
     }
 
-    void for_each_anchor_name(Function<void(FlyString const&)>) const;
+    void for_each_anchor_name(Function<void(Utf16FlyString const&)>) const;
 
     HashMap<PropertyID, NonnullRefPtr<StyleValue const>> const& animated_property_values() const;
     RefPtr<AnimatedProperties const> animated_properties_snapshot() const;
@@ -146,6 +148,10 @@ public:
     bool is_animated_property_result_of_transition(PropertyID property_id) const;
     bool depends_on_viewport_metrics() const { return m_depends_on_viewport_metrics; }
     bool font_metrics_depend_on_viewport_metrics() const { return m_font_metrics_depend_on_viewport_metrics; }
+    // Whether the element this style was computed for has computed display none, or is a descendant of one that does.
+    bool in_display_none_subtree() const { return m_in_display_none_subtree; }
+    void set_in_display_none_subtree(Badge<DOM::Element>) { m_in_display_none_subtree = true; }
+    void set_in_display_none_subtree(Badge<DOM::SyntheticPseudoElement>) { m_in_display_none_subtree = true; }
     bool has_pseudo_element_style(PseudoElement) const;
     void set_depends_on_viewport_metrics(Badge<StyleComputer>);
     void set_font_metrics_depend_on_viewport_metrics(Badge<StyleComputer>);
@@ -162,7 +168,7 @@ public:
     HashMap<PropertyID, StyleValueVector> assemble_coordinated_value_list(PropertyID base_property_id, Vector<PropertyID> const& property_ids) const;
     ColorInterpolation color_interpolation() const;
     ColorInterpolation color_interpolation_filters() const;
-    PreferredColorScheme color_scheme(PreferredColorScheme, Optional<Vector<String> const&> document_supported_schemes) const;
+    PreferredColorScheme color_scheme(PreferredColorScheme, Optional<Vector<Utf16FlyString> const&> document_supported_schemes) const;
     TextAnchor text_anchor() const;
     Optional<BaselineMetric> dominant_baseline() const;
     TextAlign text_align() const;
@@ -243,9 +249,9 @@ public:
     Optional<FontVariantNumeric> font_variant_numeric() const;
     FontVariantPosition font_variant_position() const;
     FontKerning font_kerning() const;
-    Optional<FlyString> font_language_override() const;
-    HashMap<FlyString, u8> font_feature_settings() const;
-    HashMap<FlyString, double> font_variation_settings() const;
+    Optional<Utf16FlyString> font_language_override() const;
+    HashMap<Utf16FlyString, u8> font_feature_settings() const;
+    HashMap<Utf16FlyString, double> font_variation_settings() const;
     GridTrackSizeList grid_auto_columns() const;
     GridTrackSizeList grid_auto_rows() const;
     GridTrackSizeList grid_template_columns() const;
@@ -268,10 +274,10 @@ public:
     Isolation isolation() const;
     TouchActionData touch_action() const;
     Containment contain() const;
-    Vector<FlyString> container_name() const;
+    Vector<Utf16FlyString> container_name() const;
     ContainerType container_type() const;
     MixBlendMode mix_blend_mode() const;
-    Optional<FlyString> view_transition_name() const;
+    Optional<Utf16FlyString> view_transition_name() const;
     Vector<AnimationProperties> animations(DOM::AbstractElement const&) const;
     Vector<TransitionProperties> transitions() const;
 
@@ -371,6 +377,7 @@ private:
     RefPtr<AnimatedProperties> m_animated_properties;
     bool m_depends_on_viewport_metrics { false };
     bool m_font_metrics_depend_on_viewport_metrics { false };
+    bool m_in_display_none_subtree { false };
 
     mutable RefPtr<Gfx::FontCascadeList const> m_cached_computed_font_list;
     mutable RefPtr<Gfx::Font const> m_cached_first_available_computed_font;

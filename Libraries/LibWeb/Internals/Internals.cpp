@@ -144,13 +144,12 @@ WebIDL::ExceptionOr<void> Internals::load_reference_test_metadata()
         auto content = as<DOM::Element>(fuzzy_node)->get_attribute_value(HTML::AttributeNames::content);
 
         JsonObject fuzzy_configuration;
-        if (content.contains(':')) {
-            auto content_parts = MUST(content.split_limit(':', 2));
-            auto reference_url = document->encoding_parse_url(content_parts[0]);
+        if (auto colon_offset = content.find_code_unit_offset(':'); colon_offset.has_value()) {
+            auto reference_url = document->encoding_parse_url(content.substring_view(0, *colon_offset));
             fuzzy_configuration.set("reference"sv, reference_url->to_string());
-            content = content_parts[1];
+            content = Utf16String::from_utf16(content.substring_view(*colon_offset + 1));
         }
-        fuzzy_configuration.set("content"sv, content);
+        fuzzy_configuration.set("content"sv, content.to_utf8());
 
         fuzzy_configurations.must_append(fuzzy_configuration);
     }
@@ -577,7 +576,7 @@ String Internals::get_computed_role(DOM::Element& element)
 String Internals::get_computed_label(DOM::Element& element)
 {
     auto& active_document = window().associated_document();
-    return MUST(element.accessible_name(active_document));
+    return MUST(element.accessible_name(active_document)).to_utf8();
 }
 
 String Internals::get_computed_aria_level(DOM::Element& element)
@@ -633,6 +632,16 @@ void Internals::set_device_pixel_ratio(double ratio)
 bool Internals::headless()
 {
     return page().client().is_headless();
+}
+
+bool Internals::needs_repaint()
+{
+    return page().top_level_traversable()->needs_repaint();
+}
+
+bool Internals::screen_wake_lock_active()
+{
+    return page().is_screen_wake_lock_active();
 }
 
 String Internals::dump_display_list()
@@ -842,6 +851,7 @@ JS::Object* Internals::get_style_invalidation_counters()
     object->define_direct_property("previousSiblingInvalidationWalkVisits"_utf16_fly_string, JS::Value(counters.previous_sibling_invalidation_walk_visits), JS::default_attributes);
     object->define_direct_property("descendantSlotInvalidationSubtreeScans"_utf16_fly_string, JS::Value(counters.descendant_slot_invalidation_subtree_scans), JS::default_attributes);
     object->define_direct_property("mediaRuleEvaluations"_utf16_fly_string, JS::Value(counters.media_rule_evaluations), JS::default_attributes);
+    object->define_direct_property("registeredPropertiesCacheRebuilds"_utf16_fly_string, JS::Value(counters.registered_properties_cache_rebuilds), JS::default_attributes);
     return object;
 }
 
@@ -857,7 +867,7 @@ void Internals::update_style()
 
 void Internals::set_preferred_color_scheme(StringView color_scheme)
 {
-    auto preferred_color_scheme = CSS::preferred_color_scheme_from_string(color_scheme);
+    auto preferred_color_scheme = CSS::preferred_color_scheme_from_string(Utf16String::from_utf8(color_scheme));
 
     Optional<CSS::PreferredColorScheme> preferred_color_scheme_override;
     if (preferred_color_scheme != CSS::PreferredColorScheme::Auto)
@@ -867,6 +877,11 @@ void Internals::set_preferred_color_scheme(StringView color_scheme)
     auto& document = window().associated_document();
     document.invalidate_style(DOM::StyleInvalidationReason::SettingsChange);
     document.set_needs_media_query_evaluation();
+}
+
+void Internals::set_page_focus(bool has_focus)
+{
+    page().client().set_has_focus(has_focus);
 }
 
 String Internals::canvas_color_scheme()

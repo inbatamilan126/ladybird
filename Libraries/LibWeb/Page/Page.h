@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <AK/Assertions.h>
 #include <AK/ByteBuffer.h>
 #include <AK/JsonValue.h>
 #include <AK/Queue.h>
@@ -44,7 +45,9 @@
 #include <LibWeb/HTML/AudioPlayState.h>
 #include <LibWeb/HTML/ColorPickerUpdateState.h>
 #include <LibWeb/HTML/FileFilter.h>
+#include <LibWeb/HTML/NavigableId.h>
 #include <LibWeb/HTML/POSTResource.h>
+#include <LibWeb/HTML/ReplicatedNavigableState.h>
 #include <LibWeb/HTML/Scripting/ScriptRegistry.h>
 #include <LibWeb/HTML/SelectItem.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
@@ -55,6 +58,7 @@
 #include <LibWeb/Loader/FileRequest.h>
 #include <LibWeb/Page/EventResult.h>
 #include <LibWeb/Page/InputEvent.h>
+#include <LibWeb/Page/ScreenWakeLockHandle.h>
 #include <LibWeb/Page/ViewportIsFullscreen.h>
 #include <LibWeb/Painting/ChromeMetrics.h>
 #include <LibWeb/PixelUnits.h>
@@ -82,6 +86,9 @@ public:
 
     PageClient& client() { return m_client; }
     PageClient const& client() const { return m_client; }
+    void acquire_screen_wake_lock();
+    void release_screen_wake_lock();
+    bool is_screen_wake_lock_active() const { return m_active_screen_wake_lock_count > 0; }
     bool has_compositor_host() const;
     void ensure_compositor_host();
     Compositor::CompositorHost& compositor_host();
@@ -127,6 +134,9 @@ public:
     EventResult handle_mousedown(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count);
     EventResult handle_mousemove(DevicePixelPoint, DevicePixelPoint screen_position, unsigned buttons, unsigned modifiers);
     EventResult handle_mouseleave();
+#if defined(AK_OS_MACOS)
+    bool select_word_for_dictionary_lookup(DevicePixelPoint);
+#endif
     UniqueNodeID node_id_at_position(DevicePixelPoint);
     EventResult handle_mousewheel(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, bool async_scroll_performed_default_action = false, Optional<AsyncScrollOperation>* async_scroll_operation = nullptr);
 
@@ -256,7 +266,7 @@ public:
     void toggle_media_controls_state();
 
     HTML::MuteState page_mute_state() const { return m_mute_state; }
-    void toggle_page_mute_state();
+    void set_page_mute_state(HTML::MuteState);
 
     Optional<String> const& user_style() const { return m_user_style_sheet_source; }
     void set_user_style(String source);
@@ -368,6 +378,7 @@ private:
     Optional<UniqueNodeID> m_media_context_menu_element_id;
 
     Web::HTML::MuteState m_mute_state { Web::HTML::MuteState::Unmuted };
+    size_t m_active_screen_wake_lock_count { 0 };
 
     Optional<String> m_user_style_sheet_source;
 
@@ -434,23 +445,24 @@ public:
     virtual Page const& page() const = 0;
     virtual bool is_connection_open() const = 0;
     virtual bool has_focus() const { return true; }
+    virtual void set_has_focus([[maybe_unused]] bool has_focus) { }
     virtual bool has_active_devtools_client() const { return false; }
     // In Ladybird, Remote currently implies replacing the WebContent process.
     virtual NavigationProcessDecision decide_navigation_process(
         [[maybe_unused]] URL::URL const& current_url,
         [[maybe_unused]] URL::URL const& target_url,
         [[maybe_unused]] NavigationTarget target = NavigationTarget::TopLevel,
-        [[maybe_unused]] Optional<String> frame_id = {}) const
+        [[maybe_unused]] Optional<HTML::NavigableId> frame_id = {}) const
     {
         return NavigationProcessDecision::Local;
     }
     virtual void request_new_process_for_navigation(URL::URL const&, Variant<Empty, String, HTML::POSTResource>, Bindings::NavigationHistoryBehavior) { }
-    virtual void request_new_process_for_child_frame_navigation(String const&, URL::URL const&, Variant<Empty, String, HTML::POSTResource>, Bindings::NavigationHistoryBehavior) { }
-    virtual void page_did_create_child_frame(String const&, String const&) { }
-    virtual void page_did_update_child_frame_viewport(String const&, CSSPixelRect) { }
-    virtual void page_did_commit_child_frame_navigation(String const&, URL::URL const&) { }
-    virtual void page_did_destroy_child_frame(String const&) { }
-    virtual Optional<Compositor::CompositorContextId> compositor_context_id_for_remote_child_frame(String const&) const { return {}; }
+    virtual void request_new_process_for_child_frame_navigation(HTML::NavigableId, URL::URL const&, Variant<Empty, String, HTML::POSTResource>, Bindings::NavigationHistoryBehavior) { }
+    virtual void page_did_create_child_frame(HTML::NavigableId, HTML::NavigableId, HTML::ReplicatedNavigableState const&) { }
+    virtual void page_did_update_child_frame_viewport(HTML::NavigableId, CSSPixelRect) { }
+    virtual void page_did_commit_child_frame_navigation(HTML::NavigableId, HTML::ReplicatedNavigableState const&) { }
+    virtual void page_did_destroy_child_frame(HTML::NavigableId) { }
+    virtual Optional<Compositor::CompositorContextId> compositor_context_id_for_remote_child_frame(HTML::NavigableId) const { return {}; }
     virtual String dump_site_isolation_process_tree_for_testing() { return {}; }
     virtual Gfx::Palette palette() const = 0;
     virtual DevicePixelRect screen_rect() const = 0;
@@ -470,6 +482,10 @@ public:
             return Compositor::compositor_context_id_for_page(id());
         VERIFY_NOT_REACHED();
     }
+    virtual HTML::NavigableId allocate_navigable_id()
+    {
+        VERIFY_NOT_REACHED();
+    }
     virtual void request_frame() = 0;
     virtual void page_did_change_title(Utf16String const&) { }
     virtual void page_did_change_url(URL::URL const&) { }
@@ -481,16 +497,16 @@ public:
     virtual void page_did_request_minimize_window() { }
     virtual void page_did_request_fullscreen_window() { }
     virtual void page_did_request_exit_fullscreen() { }
-    virtual void page_did_start_loading(URL::URL const&, Variant<Empty, String, HTML::POSTResource> document_resource, bool is_redirect, Bindings::NavigationHistoryBehavior history_handling = Bindings::NavigationHistoryBehavior::Auto)
+    virtual void page_did_start_loading(Optional<String> const&, URL::URL const&, Variant<Empty, String, HTML::POSTResource> document_resource, bool is_redirect, Bindings::NavigationHistoryBehavior history_handling = Bindings::NavigationHistoryBehavior::Auto)
     {
         (void)document_resource;
         (void)is_redirect;
         (void)history_handling;
     }
-    virtual void page_did_cancel_loading(URL::URL const&) { }
+    virtual void page_did_cancel_loading(Optional<String> const&, URL::URL const&) { }
     virtual void page_did_create_new_document(Web::DOM::Document&) { }
     virtual void page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document&) { }
-    virtual void page_did_finish_loading(URL::URL const&) { }
+    virtual void page_did_finish_loading(Optional<String> const&, URL::URL const&) { }
     virtual Optional<u64> page_did_start_download(URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data)
     {
         (void)suggested_filename;
@@ -593,6 +609,7 @@ public:
     virtual void page_did_update_primary_selection(String const&) { }
 
     virtual void page_did_change_audio_play_state(HTML::AudioPlayState) { }
+    virtual void page_did_change_screen_wake_lock_state(ScreenWakeLockState) { }
 
     virtual void page_did_start_network_request([[maybe_unused]] u64 request_id, [[maybe_unused]] URL::URL const& url, [[maybe_unused]] ByteString const& method, [[maybe_unused]] Vector<HTTP::Header> const& request_headers, [[maybe_unused]] ReadonlyBytes request_body, [[maybe_unused]] Optional<String> initiator_type) { }
     virtual void page_did_receive_network_response_headers([[maybe_unused]] u64 request_id, [[maybe_unused]] u32 status_code, [[maybe_unused]] Optional<String> reason_phrase, [[maybe_unused]] Vector<HTTP::Header> const& response_headers) { }
@@ -605,7 +622,7 @@ public:
     virtual HTML::WorkerAgentId start_worker_agent([[maybe_unused]] HTML::WorkerAgentStartRequest&& request) { return {}; }
     virtual void close_worker_agent([[maybe_unused]] HTML::WorkerAgentId agent_id, [[maybe_unused]] HTML::WorkerAgentOwnerToken owner_token) { }
 
-    virtual void page_did_mutate_dom([[maybe_unused]] FlyString const& type, [[maybe_unused]] DOM::Node const& target, [[maybe_unused]] DOM::NodeList& added_nodes, [[maybe_unused]] DOM::NodeList& removed_nodes, [[maybe_unused]] GC::Ptr<DOM::Node> previous_sibling, [[maybe_unused]] GC::Ptr<DOM::Node> next_sibling, [[maybe_unused]] Optional<String> const& attribute_name) { }
+    virtual void page_did_mutate_dom([[maybe_unused]] FlyString const& type, [[maybe_unused]] DOM::Node const& target, [[maybe_unused]] DOM::NodeList& added_nodes, [[maybe_unused]] DOM::NodeList& removed_nodes, [[maybe_unused]] GC::Ptr<DOM::Node> previous_sibling, [[maybe_unused]] GC::Ptr<DOM::Node> next_sibling, [[maybe_unused]] Optional<Utf16FlyString> const& attribute_name) { }
     virtual void flush_pending_dom_mutations() { }
 
     virtual void page_did_take_screenshot(Gfx::ShareableBitmap const&) { }

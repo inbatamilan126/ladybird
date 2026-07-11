@@ -15,7 +15,6 @@
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/Position.h>
 #include <LibWeb/DOM/SelectionchangeEventDispatching.h>
-#include <LibWeb/GraphemeEdgeTracker.h>
 #include <LibWeb/HTML/CustomElements/CustomElementReactionNames.h>
 #include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
@@ -35,6 +34,7 @@
 #include <LibWeb/Page/EventHandler.h>
 #include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/UIEvents/InputTypes.h>
+#include <LibWeb/VisualLines.h>
 
 namespace Web::HTML {
 
@@ -172,7 +172,7 @@ void FormAssociatedElement::form_node_was_moved()
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#association-of-controls-and-forms:category-listed-3
-void FormAssociatedElement::form_node_attribute_changed(FlyString const& name, Optional<String> const& value)
+void FormAssociatedElement::form_node_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& value)
 {
     // When a listed form-associated element's form attribute is set, changed, or removed, then the user agent must
     // reset the form owner of that element.
@@ -281,7 +281,7 @@ void FormAssociatedElement::form_associated_element_was_moved(GC::Ptr<DOM::Node>
     update_face_disabled_state();
 }
 
-void FormAssociatedElement::form_associated_element_attribute_changed(FlyString const& name, Optional<String> const&, Optional<String> const&, Optional<FlyString> const&)
+void FormAssociatedElement::form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const&, Optional<Utf16String> const&, Optional<Utf16FlyString> const&)
 {
     if (name == HTML::AttributeNames::disabled)
         update_face_disabled_state();
@@ -332,7 +332,7 @@ String FormAssociatedElement::form_action() const
     return {};
 }
 
-void FormAssociatedElement::set_form_action(String const& value)
+void FormAssociatedElement::set_form_action(Utf16String const& value)
 {
     auto& html_element = form_associated_element_to_html_element();
     html_element.set_attribute_value(HTML::AttributeNames::formaction, value);
@@ -1011,6 +1011,7 @@ void FormAssociatedTextControlElement::set_the_selection_range(Optional<WebIDL::
     bool was_modified = m_selection_start != new_selection_start || m_selection_end != new_selection_end;
     m_selection_start = new_selection_start;
     m_selection_end = new_selection_end;
+    m_selection_end_affinity = TextAffinity::Downstream;
 
     // 4. If direction is not identical to either "backward" or "forward", or if the direction
     //    argument was not given, set direction to "none".
@@ -1070,7 +1071,7 @@ void FormAssociatedTextControlElement::handle_insert(FlyString const& input_type
     scroll_cursor_into_view();
 }
 
-void FormAssociatedTextControlElement::handle_delete(FlyString const& input_type)
+void FormAssociatedTextControlElement::handle_delete(FlyString const& input_type, DispatchInputEvent dispatch_input_event)
 {
     auto text_node = form_associated_element_to_text_node();
     if (!text_node || !static_cast<FormAssociatedElement&>(text_control_to_html_element()).is_mutable())
@@ -1092,7 +1093,8 @@ void FormAssociatedTextControlElement::handle_delete(FlyString const& input_type
     MUST(set_range_text({}, selection_start, selection_end, Bindings::SelectionMode::End));
 
     text_node->invalidate_style(DOM::StyleInvalidationReason::EditingDeletion);
-    did_edit_text_node(input_type, {});
+    if (dispatch_input_event == DispatchInputEvent::Yes)
+        did_edit_text_node(input_type, {});
     scroll_cursor_into_view();
 }
 
@@ -1108,10 +1110,17 @@ Optional<Utf16String> FormAssociatedTextControlElement::selected_text_for_string
     return Utf16String::from_utf16(relevant_value().substring_view(start, end - start));
 }
 
-void FormAssociatedTextControlElement::collapse_selection_to_offset(size_t position)
+void FormAssociatedTextControlElement::collapse_selection_to_offset(size_t position, TextAffinity affinity)
 {
-    m_selection_start = position;
-    m_selection_end = position;
+    move_selection_end_to(position, affinity, CollapseSelection::Yes);
+}
+
+void FormAssociatedTextControlElement::move_selection_end_to(size_t offset, TextAffinity affinity, CollapseSelection collapse)
+{
+    if (collapse == CollapseSelection::Yes)
+        m_selection_start = offset;
+    m_selection_end = offset;
+    m_selection_end_affinity = affinity;
 }
 
 void FormAssociatedTextControlElement::scroll_cursor_into_view()
@@ -1123,7 +1132,7 @@ void FormAssociatedTextControlElement::scroll_cursor_into_view()
     if (!text_node)
         return;
 
-    Painting::Paintable::scroll_text_offset_into_view(*text_node, m_selection_end);
+    Painting::Paintable::scroll_text_offset_into_view(*text_node, m_selection_end, m_selection_end_affinity);
 }
 
 void FormAssociatedTextControlElement::selection_was_changed(SelectionSource source)
@@ -1168,25 +1177,30 @@ void FormAssociatedTextControlElement::select_all()
     selection_was_changed(SelectionSource::UI);
 }
 
-void FormAssociatedTextControlElement::set_selection_anchor(GC::Ref<DOM::Node> anchor_node, size_t anchor_offset)
+GC::Ptr<DOM::Node> FormAssociatedTextControlElement::mouse_selection_scope()
+{
+    return form_associated_element_to_text_node();
+}
+
+void FormAssociatedTextControlElement::set_selection_anchor(GC::Ref<DOM::Node> anchor_node, size_t anchor_offset, TextAffinity affinity)
 {
     auto editing_host_manager = text_control_to_html_element().document().editing_host_manager();
     editing_host_manager->set_selection_anchor(anchor_node, anchor_offset);
     auto text_node = form_associated_element_to_text_node();
     if (!text_node || anchor_node != text_node)
         return;
-    collapse_selection_to_offset(anchor_offset);
+    collapse_selection_to_offset(anchor_offset, affinity);
     selection_was_changed(SelectionSource::UI);
 }
 
-void FormAssociatedTextControlElement::set_selection_focus(GC::Ref<DOM::Node> focus_node, size_t focus_offset)
+void FormAssociatedTextControlElement::set_selection_focus(GC::Ref<DOM::Node> focus_node, size_t focus_offset, TextAffinity affinity)
 {
     auto editing_host_manager = text_control_to_html_element().document().editing_host_manager();
     editing_host_manager->set_selection_focus(focus_node, focus_offset);
     auto text_node = form_associated_element_to_text_node();
     if (!text_node || focus_node != text_node)
         return;
-    m_selection_end = focus_offset;
+    move_selection_end_to(focus_offset, affinity, CollapseSelection::No);
     selection_was_changed(SelectionSource::UI);
 }
 
@@ -1195,11 +1209,7 @@ void FormAssociatedTextControlElement::move_cursor_to_start(CollapseSelection co
     auto text_node = form_associated_element_to_text_node();
     if (!text_node)
         return;
-    if (collapse == CollapseSelection::Yes) {
-        collapse_selection_to_offset(0);
-    } else {
-        m_selection_end = 0;
-    }
+    move_selection_end_to(0, TextAffinity::Downstream, collapse);
     selection_was_changed(SelectionSource::UI);
 }
 
@@ -1208,11 +1218,7 @@ void FormAssociatedTextControlElement::move_cursor_to_end(CollapseSelection coll
     auto text_node = form_associated_element_to_text_node();
     if (!text_node)
         return;
-    if (collapse == CollapseSelection::Yes) {
-        collapse_selection_to_offset(text_node->length());
-    } else {
-        m_selection_end = text_node->length();
-    }
+    move_selection_end_to(text_node->length(), TextAffinity::Downstream, collapse);
     selection_was_changed(SelectionSource::UI);
 }
 
@@ -1221,12 +1227,8 @@ void FormAssociatedTextControlElement::move_cursor_to_start_of_current_line(Coll
     auto text_node = form_associated_element_to_text_node();
     if (!text_node)
         return;
-    auto new_offset = find_line_start(text_node->data().utf16_view(), m_selection_end);
-    if (collapse == CollapseSelection::Yes) {
-        collapse_selection_to_offset(new_offset);
-    } else {
-        m_selection_end = new_offset;
-    }
+    auto new_offset = find_visual_line_start(*text_node, m_selection_end, m_selection_end_affinity);
+    move_selection_end_to(new_offset, TextAffinity::Downstream, collapse);
     selection_was_changed(SelectionSource::UI);
 }
 
@@ -1235,12 +1237,8 @@ void FormAssociatedTextControlElement::move_cursor_to_end_of_current_line(Collap
     auto text_node = form_associated_element_to_text_node();
     if (!text_node)
         return;
-    auto new_offset = find_line_end(text_node->data().utf16_view(), m_selection_end);
-    if (collapse == CollapseSelection::Yes) {
-        collapse_selection_to_offset(new_offset);
-    } else {
-        m_selection_end = new_offset;
-    }
+    auto new_position = find_visual_line_end(*text_node, m_selection_end, m_selection_end_affinity);
+    move_selection_end_to(new_position.offset, new_position.affinity, collapse);
     selection_was_changed(SelectionSource::UI);
 }
 
@@ -1254,12 +1252,8 @@ void FormAssociatedTextControlElement::increment_cursor_position_offset(Collapse
         collapse_selection_to_offset(max(m_selection_start, m_selection_end));
     }
     // Otherwise, move forward if possible
-    else if (auto offset = text_node->grapheme_segmenter().next_boundary(m_selection_end); offset.has_value()) {
-        if (collapse == CollapseSelection::Yes) {
-            collapse_selection_to_offset(*offset);
-        } else {
-            m_selection_end = *offset;
-        }
+    else if (auto new_position = compute_cursor_position_on_next_character(*text_node, m_selection_end, m_selection_end_affinity); new_position.has_value()) {
+        move_selection_end_to(new_position->offset, new_position->affinity, collapse);
     }
     selection_was_changed(SelectionSource::UI);
 }
@@ -1274,12 +1268,8 @@ void FormAssociatedTextControlElement::decrement_cursor_position_offset(Collapse
         collapse_selection_to_offset(min(m_selection_start, m_selection_end));
     }
     // Otherwise, move backward if possible
-    else if (auto offset = text_node->grapheme_segmenter().previous_boundary(m_selection_end); offset.has_value()) {
-        if (collapse == CollapseSelection::Yes) {
-            collapse_selection_to_offset(*offset);
-        } else {
-            m_selection_end = *offset;
-        }
+    else if (auto new_position = compute_cursor_position_on_previous_character(*text_node, m_selection_end, m_selection_end_affinity); new_position.has_value()) {
+        move_selection_end_to(new_position->offset, new_position->affinity, collapse);
     }
     selection_was_changed(SelectionSource::UI);
 }
@@ -1293,11 +1283,7 @@ void FormAssociatedTextControlElement::increment_cursor_position_to_next_word(Co
     while (true) {
         if (auto offset = text_node->word_segmenter().next_boundary(m_selection_end); offset.has_value()) {
             auto word = text_node->data().substring_view(m_selection_end, *offset - m_selection_end);
-            if (collapse == CollapseSelection::Yes) {
-                collapse_selection_to_offset(*offset);
-            } else {
-                m_selection_end = *offset;
-            }
+            move_selection_end_to(*offset, TextAffinity::Downstream, collapse);
             if (Unicode::Segmenter::should_continue_beyond_word(word))
                 continue;
         }
@@ -1316,11 +1302,7 @@ void FormAssociatedTextControlElement::decrement_cursor_position_to_previous_wor
     while (true) {
         if (auto offset = text_node->word_segmenter().previous_boundary(m_selection_end); offset.has_value()) {
             auto word = text_node->data().substring_view(*offset, m_selection_end - *offset);
-            if (collapse == CollapseSelection::Yes) {
-                collapse_selection_to_offset(*offset);
-            } else {
-                m_selection_end = *offset;
-            }
+            move_selection_end_to(*offset, TextAffinity::Downstream, collapse);
             if (Unicode::Segmenter::should_continue_beyond_word(word))
                 continue;
         }
@@ -1336,15 +1318,11 @@ void FormAssociatedTextControlElement::increment_cursor_position_to_next_line(Co
     if (!text_node)
         return;
 
-    auto new_offset = compute_cursor_position_on_next_line(*text_node, m_selection_end);
-    if (!new_offset.has_value())
+    auto new_position = compute_cursor_position_on_next_line(*text_node, m_selection_end, m_selection_end_affinity);
+    if (!new_position.has_value())
         return;
 
-    if (collapse == CollapseSelection::Yes)
-        collapse_selection_to_offset(*new_offset);
-    else
-        m_selection_end = *new_offset;
-
+    move_selection_end_to(new_position->offset, new_position->affinity, collapse);
     selection_was_changed(SelectionSource::UI);
 }
 
@@ -1354,15 +1332,11 @@ void FormAssociatedTextControlElement::decrement_cursor_position_to_previous_lin
     if (!text_node)
         return;
 
-    auto new_offset = compute_cursor_position_on_previous_line(*text_node, m_selection_end);
-    if (!new_offset.has_value())
+    auto new_position = compute_cursor_position_on_previous_line(*text_node, m_selection_end, m_selection_end_affinity);
+    if (!new_position.has_value())
         return;
 
-    if (collapse == CollapseSelection::Yes)
-        collapse_selection_to_offset(*new_offset);
-    else
-        m_selection_end = *new_offset;
-
+    move_selection_end_to(new_position->offset, new_position->affinity, collapse);
     selection_was_changed(SelectionSource::UI);
 }
 
@@ -1373,7 +1347,7 @@ GC::Ptr<DOM::Position> FormAssociatedTextControlElement::cursor_position() const
         return nullptr;
     if (m_selection_start != m_selection_end)
         return nullptr;
-    return DOM::Position::create(node->realm(), const_cast<DOM::Text&>(*node), m_selection_start);
+    return DOM::Position::create(node->realm(), const_cast<DOM::Text&>(*node), m_selection_start, m_selection_end_affinity);
 }
 
 GC::Ref<JS::Cell> FormAssociatedTextControlElement::as_cell()

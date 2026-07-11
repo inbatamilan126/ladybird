@@ -30,17 +30,19 @@ public:
 
     GC::Ref<HTMLCollection> children();
 
-    GC::Ref<HTMLCollection> get_elements_by_tag_name(FlyString const&);
-    GC::Ref<HTMLCollection> get_elements_by_tag_name_ns(Optional<FlyString>, FlyString const&);
+    GC::Ref<HTMLCollection> get_elements_by_tag_name(Utf16FlyString const&);
+    GC::Ref<HTMLCollection> get_elements_by_tag_name_ns(Optional<Utf16FlyString>, Utf16FlyString const&);
 
     WebIDL::ExceptionOr<void> prepend(ReadonlySpan<Variant<GC::Ref<Node>, Utf16String>> const& nodes);
     WebIDL::ExceptionOr<void> append(ReadonlySpan<Variant<GC::Ref<Node>, Utf16String>> const& nodes);
     WebIDL::ExceptionOr<void> replace_children(ReadonlySpan<Variant<GC::Ref<Node>, Utf16String>> const& nodes);
     WebIDL::ExceptionOr<void> move_before(GC::Ref<Node> node, GC::Ptr<Node> child);
 
-    GC::Ref<HTMLCollection> get_elements_by_class_name(StringView);
+    GC::Ref<HTMLCollection> get_elements_by_class_name(Utf16String const&);
 
-    GC::Ptr<Element> get_element_by_id(FlyString const& id) const;
+    GC::Ptr<Element> get_element_by_id(Utf16FlyString const& id) const;
+    GC::Ptr<Element> get_element_by_id(Utf16String const& id) const;
+    GC::Ptr<Element> get_element_by_id(Utf16View id) const;
 
     bool has_child_affected_by_last_child_pseudo_class() const { return m_has_child_affected_by_last_child_pseudo_class; }
     void set_has_child_affected_by_last_child_pseudo_class(bool value) { m_has_child_affected_by_last_child_pseudo_class = value; }

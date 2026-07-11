@@ -48,23 +48,40 @@ private:
 // https://drafts.csswg.org/css-conditional-5/#typedef-style-feature
 class StyleFeature final : public BooleanExpression {
 public:
+    using StyleRangeValue = Variant<PropertyNameAndID, Vector<Parser::ComponentValue>>;
+
     static NonnullOwnPtr<StyleFeature> create_boolean(PropertyNameAndID);
     static NonnullOwnPtr<StyleFeature> create_plain(PropertyNameAndID, Vector<Parser::ComponentValue> value);
+    static NonnullOwnPtr<StyleFeature> create_range(StyleRangeValue left, FeatureComparison comparison, StyleRangeValue right);
+    static NonnullOwnPtr<StyleFeature> create_range(StyleRangeValue left, FeatureComparison left_comparison, StyleRangeValue middle, FeatureComparison right_comparison, StyleRangeValue right);
 
     virtual MatchResult evaluate(BooleanExpressionEvaluationContext const&) const override;
     virtual void collect_container_query_feature_requirements(ContainerQueryFeatureRequirements&) const override;
     virtual String to_string() const override;
     virtual void dump(StringBuilder&, int indent_levels = 0) const override;
 
+    struct StyleFeaturePlain {
+        PropertyNameAndID property;
+        Optional<Vector<Parser::ComponentValue>> value;
+    };
+
+    struct StyleRange {
+        StyleRangeValue left;
+        FeatureComparison left_comparison;
+        StyleRangeValue middle;
+        Optional<FeatureComparison> right_comparison {};
+        Optional<StyleRangeValue> right {};
+    };
+
 private:
-    StyleFeature(PropertyNameAndID property, Optional<Vector<Parser::ComponentValue>> value)
-        : m_property(move(property))
-        , m_value(move(value))
+    using Feature = Variant<StyleFeaturePlain, StyleRange>;
+
+    explicit StyleFeature(Feature feature)
+        : m_feature(move(feature))
     {
     }
 
-    PropertyNameAndID m_property;
-    Optional<Vector<Parser::ComponentValue>> m_value;
+    Feature m_feature;
 };
 
 // https://drafts.csswg.org/css-conditional-5/#container-rule
@@ -75,7 +92,7 @@ public:
     bool matches() const { return m_matches; }
     ContainerQueryFeatureRequirements const& feature_requirements() const { return m_feature_requirements; }
     bool contains_size_feature() const { return m_feature_requirements.contains_size_feature(); }
-    MatchResult evaluate(DOM::AbstractElement const&, Optional<FlyString> const& container_name) const;
+    MatchResult evaluate(DOM::AbstractElement const&, Optional<Utf16FlyString> const& container_name) const;
     String to_string() const;
 
     void dump(StringBuilder&, int indent_levels = 0) const;
@@ -88,9 +105,9 @@ private:
     bool m_matches { false };
 };
 
-Optional<SizeFeatureID> size_feature_id_from_string(StringView);
+Optional<SizeFeatureID> size_feature_id_from_string(Utf16View);
 StringView string_from_size_feature_id(SizeFeatureID);
 bool size_feature_type_is_range(SizeFeatureID);
-bool container_name_matches(DOM::Element const&, Optional<FlyString> const& container_name);
+bool container_name_matches(DOM::Element const&, Optional<Utf16FlyString> const& container_name);
 
 }

@@ -20,6 +20,7 @@
 #include <LibWeb/Painting/StackingContext.h>
 #include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/AttributeParser.h>
+#include <LibWeb/SVG/FragmentIdentifier.h>
 #include <LibWeb/SVG/SVGGraphicsElement.h>
 #include <LibWeb/SVG/SVGPatternElement.h>
 
@@ -46,36 +47,36 @@ void SVGPatternElement::visit_edges(Cell::Visitor& visitor)
     SVGFitToViewBox::visit_edges(visitor);
 }
 
-void SVGPatternElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void SVGPatternElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
     SVGFitToViewBox::attribute_changed(*this, name, value);
 
     if (name == AttributeNames::patternUnits) {
-        m_pattern_units = AttributeParser::parse_units(value.value_or(String {}));
+        m_pattern_units = AttributeParser::parse_units(value.value_or({}));
     } else if (name == AttributeNames::patternContentUnits) {
-        m_pattern_content_units = AttributeParser::parse_units(value.value_or(String {}));
+        m_pattern_content_units = AttributeParser::parse_units(value.value_or({}));
     } else if (name == AttributeNames::patternTransform) {
-        if (auto transform_list = AttributeParser::parse_transform(value.value_or(String {})); transform_list.has_value()) {
+        if (auto transform_list = AttributeParser::parse_transform(value.value_or({})); transform_list.has_value()) {
             m_pattern_transform = transform_from_transform_list(*transform_list);
         } else {
             m_pattern_transform = {};
         }
     } else if (name == AttributeNames::x) {
-        m_x = AttributeParser::parse_number_percentage(value.value_or(String {}));
+        m_x = AttributeParser::parse_number_percentage(value.value_or({}));
     } else if (name == AttributeNames::y) {
-        m_y = AttributeParser::parse_number_percentage(value.value_or(String {}));
+        m_y = AttributeParser::parse_number_percentage(value.value_or({}));
     } else if (name == AttributeNames::width) {
-        m_width = AttributeParser::parse_number_percentage(value.value_or(String {}));
+        m_width = AttributeParser::parse_number_percentage(value.value_or({}));
     } else if (name == AttributeNames::height) {
-        m_height = AttributeParser::parse_number_percentage(value.value_or(String {}));
+        m_height = AttributeParser::parse_number_percentage(value.value_or({}));
     }
 }
 
 GC::Ptr<SVGPatternElement const> SVGPatternElement::linked_pattern(GC::RootHashTable<SVGPatternElement const*>& seen_patterns) const
 {
     // FIXME: This can only resolve same-document references. The spec allows cross-document references.
-    auto link = has_attribute(AttributeNames::href) ? get_attribute(AttributeNames::href) : get_attribute("xlink:href"_fly_string);
+    auto link = has_attribute(AttributeNames::href) ? get_attribute(AttributeNames::href) : get_attribute(AttributeNames::xlink_href);
     if (!link.has_value() || link->is_empty())
         return {};
 
@@ -87,7 +88,7 @@ GC::Ptr<SVGPatternElement const> SVGPatternElement::linked_pattern(GC::RootHashT
     if (!id.has_value() || id->is_empty())
         return {};
 
-    auto element = document().get_element_by_id(id.value());
+    auto element = document().get_element_by_id(decode_fragment_identifier(id.value()));
     if (!element)
         return {};
 

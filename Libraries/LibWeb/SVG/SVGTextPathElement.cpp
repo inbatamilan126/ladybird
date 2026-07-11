@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibURL/URL.h>
 #include <LibWeb/Bindings/SVGTextPathElement.h>
 #include <LibWeb/Layout/SVGTextPathBox.h>
 #include <LibWeb/SVG/AttributeNames.h>
@@ -20,12 +19,12 @@ SVGTextPathElement::SVGTextPathElement(DOM::Document& document, DOM::QualifiedNa
 {
 }
 
-void SVGTextPathElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void SVGTextPathElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
     if (name == SVG::AttributeNames::startOffset)
-        m_start_offset = AttributeParser::parse_number_percentage(value.value_or(String {}));
+        m_start_offset = AttributeParser::parse_number_percentage(value.value_or({}));
 }
 
 GC::Ptr<SVGGeometryElement const> SVGTextPathElement::path_or_shape() const

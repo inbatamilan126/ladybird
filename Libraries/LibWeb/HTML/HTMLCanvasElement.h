@@ -40,7 +40,7 @@ public:
     void set_width(WebIDL::UnsignedLong);
     void set_height(WebIDL::UnsignedLong);
 
-    virtual void attribute_changed(FlyString const& local_name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void attribute_changed(Utf16FlyString const& local_name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
     WebIDL::ExceptionOr<String> to_data_url(StringView type, Optional<JS::Value> quality);
     WebIDL::ExceptionOr<void> to_blob(GC::Ref<WebIDL::CallbackType> callback, StringView type, Optional<JS::Value> quality);
@@ -74,7 +74,9 @@ private:
     virtual void finalize() override;
     virtual void visit_edges(Cell::Visitor&) override;
 
-    virtual bool is_presentational_hint(FlyString const&) const override;
+    virtual bool is_html_canvas_element() const override { return true; }
+
+    virtual bool is_presentational_hint(Utf16FlyString const&) const override;
     virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
 
     virtual RefPtr<Layout::Node> create_layout_node(CSS::ComputedProperties const&) override;
@@ -89,5 +91,22 @@ private:
     Variant<GC::Ref<HTML::CanvasRenderingContext2D>, GC::Ref<WebGL::WebGLRenderingContext>, GC::Ref<WebGL::WebGL2RenderingContext>, Empty> m_context;
     bool m_canvas_content_dirty { false };
 };
+
+}
+
+namespace Web::DOM {
+
+template<>
+inline bool Node::fast_is<HTML::HTMLCanvasElement>() const { return is_html_canvas_element(); }
+
+}
+
+namespace JS {
+
+template<>
+inline bool Object::fast_is<Web::HTML::HTMLCanvasElement>() const
+{
+    return is_dom_node() && static_cast<Web::DOM::Node const&>(*this).is_html_canvas_element();
+}
 
 }

@@ -74,7 +74,7 @@ WebIDL::ExceptionOr<GC::Ref<CSSStyleSheet>> CSSStyleSheet::construct_impl(JS::Re
     sheet->set_owner_css_rule(nullptr);
 
     // 7. Set sheet’s title to the empty string.
-    sheet->set_title(String {});
+    sheet->set_title({});
 
     // 8. Unset sheet’s alternate flag.
     sheet->set_alternate(false);
@@ -151,7 +151,7 @@ size_t CSSStyleSheet::external_memory_size() const
 {
     auto size = Base::external_memory_size();
     if (m_source_text.has_value())
-        size = JS::saturating_add_external_memory_size(size, JS::string_external_memory_size(*m_source_text));
+        size = JS::saturating_add_external_memory_size(size, JS::utf16_string_external_memory_size(*m_source_text));
     size = JS::saturating_add_external_memory_size(size, JS::hash_map_external_memory_size(m_namespace_rules));
     size = JS::saturating_add_external_memory_size(size, JS::vector_external_memory_size(m_import_rules));
     size = JS::saturating_add_external_memory_size(size, JS::hash_table_external_memory_size(m_owning_documents_or_shadow_roots));
@@ -374,10 +374,12 @@ void CSSStyleSheet::add_owning_document_or_shadow_root(DOM::Node& document_or_sh
     m_owning_documents_or_shadow_roots.set(document_or_shadow_root);
 
     // CSSOM's "add a CSS style sheet" steps bail out once the disabled flag is set, so ownership alone should not
-    // make a disabled sheet observable in the destination document. Delay CSS-connected font activation until the
-    // sheet actually becomes enabled.
-    if (!disabled() && this->owning_documents_or_shadow_roots().size() == 1)
+    // make a disabled sheet observable in the destination document. Delay its media-query evaluation and
+    // CSS-connected font activation until the sheet actually becomes enabled.
+    if (!disabled() && this->owning_documents_or_shadow_roots().size() == 1) {
+        evaluate_media_queries(document_or_shadow_root.document());
         document_or_shadow_root.document().font_computer().load_fonts_from_sheet(*this);
+    }
 
     for (auto const& import_rule : m_import_rules) {
         if (import_rule->loaded_style_sheet())
@@ -576,7 +578,7 @@ bool CSSStyleSheet::evaluate_media_queries(DOM::Document const& document, Functi
     return any_media_queries_changed_match_state;
 }
 
-Optional<FlyString> CSSStyleSheet::default_namespace() const
+Optional<Utf16FlyString> CSSStyleSheet::default_namespace() const
 {
     if (m_default_namespace_rule)
         return m_default_namespace_rule->namespace_uri();
@@ -584,9 +586,9 @@ Optional<FlyString> CSSStyleSheet::default_namespace() const
     return {};
 }
 
-HashTable<FlyString> CSSStyleSheet::declared_namespaces() const
+HashTable<Utf16FlyString> CSSStyleSheet::declared_namespaces() const
 {
-    HashTable<FlyString> declared_namespaces;
+    HashTable<Utf16FlyString> declared_namespaces;
 
     for (auto namespace_ : m_namespace_rules.keys()) {
         declared_namespaces.set(namespace_);
@@ -595,7 +597,7 @@ HashTable<FlyString> CSSStyleSheet::declared_namespaces() const
     return declared_namespaces;
 }
 
-Optional<FlyString> CSSStyleSheet::namespace_uri(StringView namespace_prefix) const
+Optional<Utf16FlyString> CSSStyleSheet::namespace_uri(Utf16View namespace_prefix) const
 {
     return m_namespace_rules.get(namespace_prefix)
         .map([](GC::Ptr<CSSNamespaceRule> namespace_) {

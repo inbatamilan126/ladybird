@@ -97,10 +97,10 @@ GC::Ref<HTMLCollection> ParentNode::children()
 
 // https://dom.spec.whatwg.org/#concept-getelementsbytagname
 // NOTE: This method is only exposed on Document and Element, but is in ParentNode to prevent code duplication.
-GC::Ref<HTMLCollection> ParentNode::get_elements_by_tag_name(FlyString const& qualified_name)
+GC::Ref<HTMLCollection> ParentNode::get_elements_by_tag_name(Utf16FlyString const& qualified_name)
 {
     // 1. If qualifiedName is "*" (U+002A), return a HTMLCollection rooted at root, whose filter matches only descendant elements.
-    if (qualified_name == "*") {
+    if (qualified_name == "*"sv) {
         return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, [](Element const&) {
             return true;
         });
@@ -108,7 +108,8 @@ GC::Ref<HTMLCollection> ParentNode::get_elements_by_tag_name(FlyString const& qu
 
     // 2. Otherwise, if root’s node document is an HTML document, return a HTMLCollection rooted at root, whose filter matches the following descendant elements:
     if (root().document().document_type() == Document::Type::HTML) {
-        FlyString qualified_name_in_ascii_lowercase = qualified_name.to_ascii_lowercase();
+        auto lowercase_qualified_name = qualified_name.view().to_ascii_lowercase();
+        auto qualified_name_in_ascii_lowercase = Utf16FlyString::from_utf16(lowercase_qualified_name.utf16_view());
         return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, [qualified_name, qualified_name_in_ascii_lowercase](Element const& element) {
             // - Whose namespace is the HTML namespace and whose qualified name is qualifiedName, in ASCII lowercase.
             if (element.namespace_uri() == Namespace::HTML)
@@ -127,28 +128,28 @@ GC::Ref<HTMLCollection> ParentNode::get_elements_by_tag_name(FlyString const& qu
 
 // https://dom.spec.whatwg.org/#concept-getelementsbytagnamens
 // NOTE: This method is only exposed on Document and Element, but is in ParentNode to prevent code duplication.
-GC::Ref<HTMLCollection> ParentNode::get_elements_by_tag_name_ns(Optional<FlyString> namespace_, FlyString const& local_name)
+GC::Ref<HTMLCollection> ParentNode::get_elements_by_tag_name_ns(Optional<Utf16FlyString> namespace_, Utf16FlyString const& local_name)
 {
     // 1. If namespace is the empty string, set it to null.
-    if (namespace_ == FlyString {})
+    if (namespace_ == Utf16FlyString {})
         namespace_ = OptionalNone {};
 
     // 2. If both namespace and localName are "*" (U+002A), return a HTMLCollection rooted at root, whose filter matches descendant elements.
-    if (namespace_ == "*" && local_name == "*") {
+    if (namespace_ == "*"sv && local_name == "*"sv) {
         return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, [](Element const&) {
             return true;
         });
     }
 
     // 3. Otherwise, if namespace is "*" (U+002A), return a HTMLCollection rooted at root, whose filter matches descendant elements whose local name is localName.
-    if (namespace_ == "*") {
+    if (namespace_ == "*"sv) {
         return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, [local_name](Element const& element) {
             return element.local_name() == local_name;
         });
     }
 
     // 4. Otherwise, if localName is "*" (U+002A), return a HTMLCollection rooted at root, whose filter matches descendant elements whose namespace is namespace.
-    if (local_name == "*") {
+    if (local_name == "*"sv) {
         return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, [namespace_](Element const& element) {
             return element.namespace_uri() == namespace_;
         });
@@ -172,6 +173,7 @@ WebIDL::ExceptionOr<void> ParentNode::prepend(ReadonlySpan<Variant<GC::Ref<Node>
     return {};
 }
 
+// https://dom.spec.whatwg.org/#dom-parentnode-append
 WebIDL::ExceptionOr<void> ParentNode::append(ReadonlySpan<Variant<GC::Ref<Node>, Utf16String>> const& nodes)
 {
     // 1. Let node be the result of converting nodes into a node given nodes and this’s node document.
@@ -183,13 +185,14 @@ WebIDL::ExceptionOr<void> ParentNode::append(ReadonlySpan<Variant<GC::Ref<Node>,
     return {};
 }
 
+// https://dom.spec.whatwg.org/#dom-parentnode-replacechildren
 WebIDL::ExceptionOr<void> ParentNode::replace_children(ReadonlySpan<Variant<GC::Ref<Node>, Utf16String>> const& nodes)
 {
     // 1. Let node be the result of converting nodes into a node given nodes and this’s node document.
     auto node = TRY(convert_nodes_to_single_node(nodes, document()));
 
-    // 2. Ensure pre-insertion validity of node into this before null.
-    TRY(ensure_pre_insertion_validity(realm(), node, nullptr));
+    // 2. Ensure pre-insert validity given node, this, null, and this’s children.
+    TRY(ensure_pre_insert_validity(realm(), node, nullptr, ChildrenToExclude::AllChildren));
 
     // 3. Replace all with node within this.
     replace_all(*node);
@@ -213,12 +216,27 @@ WebIDL::ExceptionOr<void> ParentNode::move_before(GC::Ref<Node> node, GC::Ptr<No
 }
 
 // https://dom.spec.whatwg.org/#dom-document-getelementsbyclassname
-GC::Ref<HTMLCollection> ParentNode::get_elements_by_class_name(StringView class_names)
+GC::Ref<HTMLCollection> ParentNode::get_elements_by_class_name(Utf16String const& class_names)
 {
-    Vector<FlyString> list_of_class_names;
-    for (auto& name : class_names.split_view_if(Infra::is_ascii_whitespace)) {
-        list_of_class_names.append(FlyString::from_utf8(name).release_value_but_fixme_should_propagate_errors());
+    Vector<Utf16FlyString> list_of_class_names;
+    auto class_names_view = class_names.utf16_view();
+    Optional<size_t> token_start;
+    for (size_t i = 0; i < class_names_view.length_in_code_units(); ++i) {
+        if (Infra::is_ascii_whitespace(class_names_view.code_unit_at(i))) {
+            if (token_start.has_value()) {
+                list_of_class_names.append(Utf16FlyString::from_utf16(class_names_view.substring_view(*token_start, i - *token_start)));
+                token_start = {};
+            }
+            continue;
+        }
+
+        if (!token_start.has_value())
+            token_start = i;
     }
+
+    if (token_start.has_value())
+        list_of_class_names.append(Utf16FlyString::from_utf16(class_names_view.substring_view(*token_start)));
+
     return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, [list_of_class_names = move(list_of_class_names), quirks_mode = document().in_quirks_mode()](Element const& element) {
         for (auto& name : list_of_class_names) {
             if (!element.has_class(name, quirks_mode ? CaseSensitivity::CaseInsensitive : CaseSensitivity::CaseSensitive))
@@ -228,7 +246,7 @@ GC::Ref<HTMLCollection> ParentNode::get_elements_by_class_name(StringView class_
     });
 }
 
-GC::Ptr<Element> ParentNode::get_element_by_id(FlyString const& id) const
+GC::Ptr<Element> ParentNode::get_element_by_id(Utf16FlyString const& id) const
 {
     if (is_connected()) {
         // For connected document and shadow root we have a cache that allows fast lookup.
@@ -255,6 +273,16 @@ GC::Ptr<Element> ParentNode::get_element_by_id(FlyString const& id) const
         return TraversalDecision::Continue;
     });
     return found_element;
+}
+
+GC::Ptr<Element> ParentNode::get_element_by_id(Utf16View id) const
+{
+    return get_element_by_id(Utf16FlyString::from_utf16(id));
+}
+
+GC::Ptr<Element> ParentNode::get_element_by_id(Utf16String const& id) const
+{
+    return get_element_by_id(id.utf16_view());
 }
 
 }

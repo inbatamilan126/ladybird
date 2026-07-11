@@ -10,6 +10,8 @@
 #include <AK/JsonObjectSerializer.h>
 #include <AK/JsonValue.h>
 #include <AK/Math.h>
+#include <AK/Utf16FlyString.h>
+#include <AK/Utf16String.h>
 #include <LibCore/Process.h>
 #include <LibCore/Timer.h>
 #include <LibDevTools/IndexedDBSerialization.h>
@@ -24,6 +26,7 @@
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/CSS/StyleSheetIdentifier.h>
 #include <LibWeb/CSS/StyleSheetList.h>
+#include <LibWeb/Compositor/CompositorHost.h>
 #include <LibWeb/DOM/CharacterData.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
@@ -44,9 +47,9 @@
 #include <LibWeb/InvalidateDisplayList.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/Streams/ReadableStreamDefaultReader.h>
 #include <LibWeb/WebIDL/Promise.h>
-#include <LibWebView/SiteIsolation.h>
 #include <LibWebView/ViewImplementation.h>
 #include <WebContent/ConnectionFromClient.h>
 #include <WebContent/DevToolsConsoleClient.h>
@@ -94,15 +97,16 @@ void PageClient::set_should_report_session_history_updates_in_test_mode(bool sho
     s_should_report_session_history_updates_in_test_mode = should_report;
 }
 
-GC::Ref<PageClient> PageClient::create(JS::VM& vm, PageHost& page_host, u64 id)
+GC::Ref<PageClient> PageClient::create(JS::VM& vm, PageHost& page_host, u64 id, Optional<Web::HTML::NavigableId> pending_root_navigable_id)
 {
-    return vm.heap().allocate<PageClient>(page_host, id);
+    return vm.heap().allocate<PageClient>(page_host, id, pending_root_navigable_id);
 }
 
-PageClient::PageClient(PageHost& owner, u64 id)
+PageClient::PageClient(PageHost& owner, u64 id, Optional<Web::HTML::NavigableId> pending_root_navigable_id)
     : m_owner(owner)
     , m_page(Web::Page::create(Web::Bindings::main_thread_vm(), *this))
     , m_id(id)
+    , m_pending_root_navigable_id(pending_root_navigable_id)
 {
     m_page->set_async_scrolling_enabled(s_async_scrolling_enabled);
     setup_palette();
@@ -148,11 +152,22 @@ void PageClient::set_has_focus(bool has_focus)
 
     m_has_focus = has_focus;
 
-    if (auto document = page().top_level_traversable()->active_document()) {
-        if (has_focus)
-            document->reset_cursor_blink_cycle();
-        document->set_cursor_position_needs_repaint();
-    }
+    if (auto document = page().top_level_traversable()->active_document(); document && has_focus)
+        document->reset_cursor_blink_cycle();
+
+    // The focus ring, the text caret, and selection highlight colors all depend on the window focus state, so
+    // nothing painted before the change can be reused; repaint every document in the traversable.
+    Function<void(Web::HTML::LocalNavigable&)> invalidate_cached_paint_recursively = [&](Web::HTML::LocalNavigable& navigable) {
+        if (auto navigable_document = navigable.active_document()) {
+            // Focus changes can arrive while layout is invalidated. We only need to invalidate cached paint
+            // on the current paintable tree here, without requiring layout to be up to date first.
+            if (auto viewport_paintable = navigable_document->unsafe_paintable())
+                viewport_paintable->invalidate_all_cached_paint();
+        }
+        for (auto& child_navigable : navigable.child_navigables())
+            invalidate_cached_paint_recursively(*child_navigable);
+    };
+    invalidate_cached_paint_recursively(page().top_level_traversable());
 }
 
 void PageClient::set_window_handle(String window_handle)
@@ -185,14 +200,20 @@ bool PageClient::is_connection_open() const
     return client().is_open();
 }
 
-Web::NavigationProcessDecision PageClient::decide_navigation_process(URL::URL const& current_url, URL::URL const& target_url, Web::NavigationTarget target, Optional<String> frame_id) const
+Web::HTML::NavigableId PageClient::allocate_navigable_id()
 {
-    if (target != Web::NavigationTarget::TopLevel)
-        return client().decide_navigation_process(m_id, move(frame_id), current_url, target_url, target);
+    if (m_pending_root_navigable_id.has_value()) {
+        auto id = *m_pending_root_navigable_id;
+        m_pending_root_navigable_id.clear();
+        return id;
+    }
 
-    return WebView::is_url_suitable_for_same_process_navigation(current_url, target_url, Web::NavigationTarget::TopLevel)
-        ? Web::NavigationProcessDecision::Local
-        : Web::NavigationProcessDecision::Remote;
+    return m_owner.allocate_navigable_id();
+}
+
+Web::NavigationProcessDecision PageClient::decide_navigation_process(URL::URL const& current_url, URL::URL const& target_url, Web::NavigationTarget target, Optional<Web::HTML::NavigableId> frame_id) const
+{
+    return client().decide_navigation_process(m_id, move(frame_id), current_url, target_url, target);
 }
 
 void PageClient::request_new_process_for_navigation(URL::URL const& url, Variant<Empty, String, Web::HTML::POSTResource> document_resource, Web::Bindings::NavigationHistoryBehavior history_handling)
@@ -203,47 +224,47 @@ void PageClient::request_new_process_for_navigation(URL::URL const& url, Variant
     client().async_did_request_new_process_for_navigation(m_id, url, move(document_resource), history_handling);
 }
 
-void PageClient::request_new_process_for_child_frame_navigation(String const& frame_id, URL::URL const& url, Variant<Empty, String, Web::HTML::POSTResource> document_resource, Web::Bindings::NavigationHistoryBehavior history_handling)
+void PageClient::request_new_process_for_child_frame_navigation(Web::HTML::NavigableId frame_id, URL::URL const& url, Variant<Empty, String, Web::HTML::POSTResource> document_resource, Web::Bindings::NavigationHistoryBehavior history_handling)
 {
     client().async_did_request_new_process_for_child_frame_navigation(m_id, frame_id, url, move(document_resource), history_handling);
 }
 
-void PageClient::page_did_create_child_frame(String const& parent_frame_id, String const& frame_id)
+void PageClient::page_did_create_child_frame(Web::HTML::NavigableId parent_frame_id, Web::HTML::NavigableId frame_id, Web::HTML::ReplicatedNavigableState const& replicated_state)
 {
-    client().async_did_create_child_frame(m_id, parent_frame_id, frame_id);
+    client().async_did_create_child_frame(m_id, parent_frame_id, frame_id, replicated_state);
 }
 
-void PageClient::page_did_update_child_frame_viewport(String const& frame_id, Web::CSSPixelRect viewport_rect)
+void PageClient::page_did_update_child_frame_viewport(Web::HTML::NavigableId frame_id, Web::CSSPixelRect viewport_rect)
 {
     client().async_did_update_child_frame_viewport(m_id, frame_id, page().css_to_device_rect(viewport_rect), page().client().device_pixel_ratio());
 }
 
-void PageClient::page_did_commit_child_frame_navigation(String const& frame_id, URL::URL const& url)
+void PageClient::page_did_commit_child_frame_navigation(Web::HTML::NavigableId frame_id, Web::HTML::ReplicatedNavigableState const& replicated_state)
 {
-    client().async_did_commit_child_frame_navigation(m_id, frame_id, url);
+    client().async_did_commit_child_frame_navigation(m_id, frame_id, replicated_state);
 }
 
-void PageClient::page_did_destroy_child_frame(String const& frame_id)
+void PageClient::page_did_destroy_child_frame(Web::HTML::NavigableId frame_id)
 {
     m_remote_child_frame_compositor_contexts.remove(frame_id);
     client().async_did_destroy_child_frame(m_id, frame_id);
 }
 
-void PageClient::set_remote_child_frame_compositor_context(String frame_id, Optional<Web::Compositor::CompositorContextId> context_id)
+void PageClient::set_remote_child_frame_compositor_context(Web::HTML::NavigableId frame_id, Optional<Web::Compositor::CompositorContextId> context_id)
 {
     if (context_id.has_value())
-        m_remote_child_frame_compositor_contexts.set(move(frame_id), *context_id);
+        m_remote_child_frame_compositor_contexts.set(frame_id, *context_id);
     else
         m_remote_child_frame_compositor_contexts.remove(frame_id);
     request_frame();
 }
 
-Optional<Web::Compositor::CompositorContextId> PageClient::compositor_context_id_for_remote_child_frame(String const& frame_id) const
+Optional<Web::Compositor::CompositorContextId> PageClient::compositor_context_id_for_remote_child_frame(Web::HTML::NavigableId frame_id) const
 {
     return m_remote_child_frame_compositor_contexts.get(frame_id);
 }
 
-void PageClient::run_iframe_load_event_steps(String const& frame_id)
+void PageClient::run_iframe_load_event_steps(Web::HTML::NavigableId frame_id)
 {
     auto active_document = page().top_level_traversable()->active_document();
     if (!active_document)
@@ -329,6 +350,12 @@ void PageClient::compositor_process_lost()
 
 void PageClient::compositor_process_reconnected()
 {
+    // Drop canvas commands recorded for the previous Compositor process: the
+    // new process allocates canvas ids from scratch, so flushing stale
+    // segments could target the wrong canvas.
+    if (auto* compositor_host = m_owner.compositor_host())
+        compositor_host->discard_canvas_2d_stream();
+
     page().top_level_traversable()->repaint_after_compositor_process_reconnect();
     page().notify_all_canvas_elements_of_lost_backing_storage();
     page().prepare_canvas_contexts_for_compositing();
@@ -512,20 +539,20 @@ void PageClient::page_did_middle_click_link(URL::URL const& url, ByteString cons
     client().async_did_middle_click_link(m_id, url, target, modifiers);
 }
 
-void PageClient::page_did_start_loading(URL::URL const& url, Variant<Empty, String, Web::HTML::POSTResource> document_resource, bool is_redirect, Web::Bindings::NavigationHistoryBehavior history_handling)
+void PageClient::page_did_start_loading(Optional<String> const& navigation_id, URL::URL const& url, Variant<Empty, String, Web::HTML::POSTResource> document_resource, bool is_redirect, Web::Bindings::NavigationHistoryBehavior history_handling)
 {
     if (m_webdriver)
         m_webdriver->page_did_start_loading({}, url);
 
-    client().async_did_start_loading(m_id, url, move(document_resource), is_redirect, history_handling);
+    client().async_did_start_loading(m_id, navigation_id, url, move(document_resource), is_redirect, history_handling);
 }
 
-void PageClient::page_did_cancel_loading(URL::URL const& url)
+void PageClient::page_did_cancel_loading(Optional<String> const& navigation_id, URL::URL const& url)
 {
     if (m_webdriver)
         m_webdriver->page_did_cancel_loading({}, url);
 
-    client().async_did_cancel_loading(m_id, url);
+    client().async_did_cancel_loading(m_id, navigation_id, url);
 }
 
 void PageClient::page_did_create_new_document(Web::DOM::Document& document)
@@ -539,6 +566,9 @@ void PageClient::page_did_change_active_document_in_top_level_browsing_context(W
 
     clear_pending_dom_mutations();
 
+    if (auto navigable = document.navigable())
+        client().async_did_change_top_level_active_document(m_id, navigable->replicated_state());
+
     if (m_web_ui && &m_web_ui->document() != &document)
         m_web_ui.clear();
 
@@ -551,9 +581,9 @@ void PageClient::page_did_change_active_document_in_top_level_browsing_context(W
     }
 }
 
-void PageClient::page_did_finish_loading(URL::URL const& url)
+void PageClient::page_did_finish_loading(Optional<String> const& navigation_id, URL::URL const& url)
 {
-    client().async_did_finish_loading(m_id, url);
+    client().async_did_finish_loading(m_id, navigation_id, url);
 }
 
 Optional<u64> PageClient::page_did_start_download(URL::URL const& url, ByteString const& suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data)
@@ -1163,6 +1193,11 @@ void PageClient::page_did_change_audio_play_state(Web::HTML::AudioPlayState play
     client().async_did_change_audio_play_state(m_id, play_state);
 }
 
+void PageClient::page_did_change_screen_wake_lock_state(Web::ScreenWakeLockState wake_lock_state)
+{
+    client().async_did_change_screen_wake_lock_state(m_id, wake_lock_state);
+}
+
 Web::HTML::WorkerAgentId PageClient::start_worker_agent(Web::HTML::WorkerAgentStartRequest&& request)
 {
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::StartWorkerAgent>(m_id, move(request));
@@ -1179,7 +1214,7 @@ void PageClient::close_worker_agent(Web::HTML::WorkerAgentId agent_id, Web::HTML
     client().async_close_worker_agent(m_id, agent_id, owner_token);
 }
 
-void PageClient::page_did_mutate_dom(FlyString const& type, Web::DOM::Node const& target, Web::DOM::NodeList& added_nodes, Web::DOM::NodeList& removed_nodes, GC::Ptr<Web::DOM::Node>, GC::Ptr<Web::DOM::Node>, Optional<String> const& attribute_name)
+void PageClient::page_did_mutate_dom(FlyString const& type, Web::DOM::Node const& target, Web::DOM::NodeList& added_nodes, Web::DOM::NodeList& removed_nodes, GC::Ptr<Web::DOM::Node>, GC::Ptr<Web::DOM::Node>, Optional<Utf16FlyString> const& attribute_name)
 {
     Optional<WebView::Mutation::Type> mutation;
 
@@ -1187,7 +1222,10 @@ void PageClient::page_did_mutate_dom(FlyString const& type, Web::DOM::Node const
         VERIFY(attribute_name.has_value());
 
         auto const& element = as<Web::DOM::Element>(target);
-        mutation = WebView::AttributeMutation { *attribute_name, element.attribute(*attribute_name) };
+        mutation = WebView::AttributeMutation {
+            *attribute_name,
+            element.attribute(*attribute_name)
+        };
     } else if (type == Web::DOM::MutationType::characterData) {
         auto const& character_data = as<Web::DOM::CharacterData>(target);
         mutation = WebView::CharacterDataMutation { character_data.data().to_utf8_but_should_be_ported_to_utf16() };
@@ -1370,7 +1408,8 @@ void PageClient::run_javascript(StringView js_source)
     // Let script be the result of creating a classic script given scriptSource, settings, baseURL, and the default classic script fetch options.
     // FIXME: This doesn't pass in "default classic script fetch options"
     // FIXME: What should the filename be here?
-    auto script = Web::HTML::ClassicScript::create("(client connection run_javascript)", js_source, settings, move(base_url));
+    auto script_source = Utf16String::from_utf8(js_source);
+    auto script = Web::HTML::ClassicScript::create("(client connection run_javascript)", script_source, settings, move(base_url));
 
     // Let evaluationStatus be the result of running the classic script script.
     auto evaluation_status = script->run();

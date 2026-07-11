@@ -73,7 +73,9 @@
 - (nonnull TabController*)createNewTab:(Web::HTML::ActivateTab)activate_tab
                                fromTab:(nullable Tab*)tab
 {
-    auto* controller = [[TabController alloc] init];
+    auto is_private = tab ? [tab isPrivate] : WebView::IsPrivate::No;
+    auto* controller = [[TabController alloc] init:is_private];
+
     [self initializeTabController:controller
                       activateTab:activate_tab
                           fromTab:tab];
@@ -83,9 +85,16 @@
 
 - (TabController*)createNewTab:(Optional<URL::URL> const&)url
                        fromTab:(Tab*)tab
+                     isPrivate:(WebView::IsPrivate)is_private
                    activateTab:(Web::HTML::ActivateTab)activate_tab
+                   tabLocation:(TabLocation)tab_location
 {
-    auto* controller = [self createNewTab:activate_tab fromTab:tab];
+    auto* controller = [[TabController alloc] init:is_private];
+
+    [self initializeTabController:controller
+                      activateTab:activate_tab
+                          fromTab:tab
+                      tabLocation:tab_location];
 
     if (url.has_value()) {
         [controller loadURL:*url];
@@ -142,6 +151,17 @@
     return self.managed_tabs.count;
 }
 
+- (void)restartPrivateBrowsingSession
+{
+    for (TabController* controller in [self.managed_tabs copy]) {
+        if ([controller isPrivate] == WebView::IsPrivate::Yes)
+            [[controller window] close];
+    }
+
+    WebView::Application::the().reset_private_browsing_session();
+    [self openNewWindow:WebView::IsPrivate::Yes];
+}
+
 - (void)rebuildBookmarksMenu
 {
     Ladybird::repopulate_application_menu(self.bookmarks_menu, WebView::Application::the().bookmarks_menu());
@@ -192,9 +212,22 @@
 
 - (void)createNewWindow:(id)sender
 {
+    [self openNewWindow:WebView::IsPrivate::No];
+}
+
+- (void)createNewPrivateWindow:(id)sender
+{
+    [self openNewWindow:WebView::IsPrivate::Yes];
+}
+
+- (void)openNewWindow:(WebView::IsPrivate)is_private
+{
+    // FIXME: Create a new tab page specific to private windows.
     [self createNewTab:WebView::Application::settings().new_tab_page_url()
                fromTab:nil
-           activateTab:Web::HTML::ActivateTab::Yes];
+             isPrivate:is_private
+           activateTab:Web::HTML::ActivateTab::Yes
+           tabLocation:TabLocation::end()];
 }
 
 - (nonnull TabController*)createChildTab:(Web::HTML::ActivateTab)activate_tab
@@ -213,14 +246,46 @@
                     activateTab:(Web::HTML::ActivateTab)activate_tab
                         fromTab:(nullable Tab*)tab
 {
+    [self initializeTabController:controller
+                      activateTab:activate_tab
+                          fromTab:tab
+                      tabLocation:TabLocation::end()];
+}
+
+- (void)initializeTabController:(TabController*)controller
+                    activateTab:(Web::HTML::ActivateTab)activate_tab
+                        fromTab:(nullable Tab*)tab
+                    tabLocation:(TabLocation)tab_location
+{
+    Optional<NSUInteger> insertion_index;
+    NSWindowTabGroup* tab_group = nil;
+
+    auto* tab_for_location = tab_location.is_after_tab() ? tab_location.tab() : tab;
+    if (tab_for_location && [tab_for_location isPrivate] != [controller isPrivate])
+        tab_for_location = nil;
+
+    if (tab_for_location) {
+        tab_group = [tab_for_location tabGroup];
+
+        if (tab_location.is_after_tab()) {
+            auto* windows = [tab_group windows];
+            auto tab_index = [windows indexOfObject:tab_for_location];
+            if (tab_index != NSNotFound)
+                insertion_index = tab_index + 1;
+        }
+    }
+
     [controller showWindow:nil];
 
-    if (tab) {
-        [[tab tabGroup] addWindow:controller.window];
+    if (tab_for_location) {
+        if (insertion_index.has_value())
+            [tab_group insertWindow:controller.window atIndex:insertion_index.value()];
+        else
+            [tab_group addWindow:controller.window];
 
         // FIXME: Can we create the tabbed window above without it becoming active in the first place?
         if (activate_tab == Web::HTML::ActivateTab::No) {
-            [tab orderFront:nil];
+            [tab_for_location orderFront:nil];
         }
     }
 
@@ -272,6 +337,9 @@
     [submenu addItem:[[NSMenuItem alloc] initWithTitle:@"New Window"
                                                 action:@selector(createNewWindow:)
                                          keyEquivalent:@"n"]];
+    [submenu addItem:[[NSMenuItem alloc] initWithTitle:@"New Private Window"
+                                                action:@selector(createNewPrivateWindow:)
+                                         keyEquivalent:@"N"]];
     [submenu addItem:[[NSMenuItem alloc] initWithTitle:@"New Tab"
                                                 action:@selector(createNewTab:)
                                          keyEquivalent:@"t"]];
@@ -280,6 +348,7 @@
                                          keyEquivalent:@"w"]];
     [submenu addItem:[NSMenuItem separatorItem]];
 
+    [submenu addItem:Ladybird::create_application_menu_item(WebView::Application::the().open_downloads_page_action())];
     [submenu addItem:[[NSMenuItem alloc] initWithTitle:@"Open Location"
                                                 action:@selector(openLocation:)
                                          keyEquivalent:@"l"]];
@@ -405,7 +474,9 @@
 
         auto* controller = [self createNewTab:url
                                       fromTab:tab
-                                  activateTab:activate_tab];
+                                    isPrivate:WebView::IsPrivate::No
+                                  activateTab:activate_tab
+                                  tabLocation:TabLocation::end()];
 
         tab = (Tab*)[controller window];
     }

@@ -15,6 +15,8 @@
 #include <LibWeb/CSS/StyleSheetIdentifier.h>
 #include <LibWeb/HTML/AudioPlayState.h>
 #include <LibWeb/HTML/FileFilter.h>
+#include <LibWeb/HTML/NavigableId.h>
+#include <LibWeb/HTML/ReplicatedNavigableState.h>
 #include <LibWeb/HTML/Scripting/ScriptRegistry.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWeb/Page/Page.h>
@@ -33,7 +35,7 @@ class PageClient final : public Web::PageClient {
     GC_DECLARE_ALLOCATOR(PageClient);
 
 public:
-    static GC::Ref<PageClient> create(JS::VM& vm, PageHost& page_host, u64 id);
+    static GC::Ref<PageClient> create(JS::VM& vm, PageHost& page_host, u64 id, Optional<Web::HTML::NavigableId> pending_root_navigable_id = {});
 
     virtual ~PageClient() override;
 
@@ -56,6 +58,7 @@ public:
     virtual void did_handle_input_event(u64 page_id, Web::InputEvent const&) override;
     virtual void report_finished_handling_input_event(u64 page_id, Web::EventResult event_was_handled) override;
     virtual Web::Compositor::CompositorContextId allocate_compositor_context_id(Web::Compositor::PagePresentationRegistration) override;
+    virtual Web::HTML::NavigableId allocate_navigable_id() override;
 
     void set_palette_impl(Gfx::PaletteImpl&);
     void set_viewport(Web::DevicePixelSize const&, double device_pixel_ratio);
@@ -69,7 +72,7 @@ public:
     void set_preferred_color_scheme(Web::CSS::PreferredColorScheme);
     void set_preferred_contrast(Web::CSS::PreferredContrast);
     void set_preferred_motion(Web::CSS::PreferredMotion);
-    void set_has_focus(bool);
+    virtual void set_has_focus(bool) override;
     void set_window_handle(String);
     void did_start_webdriver_navigation(URL::URL const&);
     struct WebDriverHistoryTraversalResult {
@@ -130,8 +133,8 @@ public:
     void send_current_needs_beforeunload_check();
     void wait_for_webdriver_navigation_completion(Optional<u64> page_load_timeout, Function<void(Web::WebDriver::Response)>);
     void did_complete_webdriver_navigation_completion(u64 request_id, Web::WebDriver::Response);
-    void run_iframe_load_event_steps(String const& frame_id);
-    void set_remote_child_frame_compositor_context(String, Optional<Web::Compositor::CompositorContextId>);
+    void run_iframe_load_event_steps(Web::HTML::NavigableId);
+    void set_remote_child_frame_compositor_context(Web::HTML::NavigableId, Optional<Web::Compositor::CompositorContextId>);
     void cancel_download(u64 download_id);
     void clear_pending_dom_mutations();
     void did_delete_all_cookies(u64 request_id);
@@ -142,20 +145,20 @@ private:
         WebView::Mutation mutation;
     };
 
-    PageClient(PageHost&, u64 id);
+    PageClient(PageHost&, u64 id, Optional<Web::HTML::NavigableId>);
 
     virtual void visit_edges(JS::Cell::Visitor&) override;
 
     // ^PageClient
     virtual bool is_connection_open() const override;
-    virtual Web::NavigationProcessDecision decide_navigation_process(URL::URL const& current_url, URL::URL const& target_url, Web::NavigationTarget, Optional<String> frame_id) const override;
+    virtual Web::NavigationProcessDecision decide_navigation_process(URL::URL const& current_url, URL::URL const& target_url, Web::NavigationTarget, Optional<Web::HTML::NavigableId> frame_id) const override;
     virtual void request_new_process_for_navigation(URL::URL const&, Variant<Empty, String, Web::HTML::POSTResource>, Web::Bindings::NavigationHistoryBehavior) override;
-    virtual void request_new_process_for_child_frame_navigation(String const& frame_id, URL::URL const&, Variant<Empty, String, Web::HTML::POSTResource>, Web::Bindings::NavigationHistoryBehavior) override;
-    virtual void page_did_create_child_frame(String const& parent_frame_id, String const& frame_id) override;
-    virtual void page_did_update_child_frame_viewport(String const& frame_id, Web::CSSPixelRect) override;
-    virtual void page_did_commit_child_frame_navigation(String const& frame_id, URL::URL const&) override;
-    virtual void page_did_destroy_child_frame(String const& frame_id) override;
-    virtual Optional<Web::Compositor::CompositorContextId> compositor_context_id_for_remote_child_frame(String const&) const override;
+    virtual void request_new_process_for_child_frame_navigation(Web::HTML::NavigableId frame_id, URL::URL const&, Variant<Empty, String, Web::HTML::POSTResource>, Web::Bindings::NavigationHistoryBehavior) override;
+    virtual void page_did_create_child_frame(Web::HTML::NavigableId parent_frame_id, Web::HTML::NavigableId frame_id, Web::HTML::ReplicatedNavigableState const&) override;
+    virtual void page_did_update_child_frame_viewport(Web::HTML::NavigableId frame_id, Web::CSSPixelRect) override;
+    virtual void page_did_commit_child_frame_navigation(Web::HTML::NavigableId frame_id, Web::HTML::ReplicatedNavigableState const&) override;
+    virtual void page_did_destroy_child_frame(Web::HTML::NavigableId frame_id) override;
+    virtual Optional<Web::Compositor::CompositorContextId> compositor_context_id_for_remote_child_frame(Web::HTML::NavigableId) const override;
     virtual String dump_site_isolation_process_tree_for_testing() override;
     virtual Gfx::Palette palette() const override;
     virtual Web::DevicePixelRect screen_rect() const override { return m_all_screen_rects[m_main_screen_index]; }
@@ -187,11 +190,11 @@ private:
     virtual void page_did_request_link_context_menu(Web::CSSPixelPoint, URL::URL const&, ByteString const& target, unsigned modifiers) override;
     virtual void page_did_request_image_context_menu(Web::CSSPixelPoint, URL::URL const&, ByteString const& target, unsigned modifiers, Optional<Gfx::Bitmap const*>) override;
     virtual void page_did_request_media_context_menu(Web::CSSPixelPoint, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const&) override;
-    virtual void page_did_start_loading(URL::URL const&, Variant<Empty, String, Web::HTML::POSTResource>, bool, Web::Bindings::NavigationHistoryBehavior) override;
-    virtual void page_did_cancel_loading(URL::URL const&) override;
+    virtual void page_did_start_loading(Optional<String> const&, URL::URL const&, Variant<Empty, String, Web::HTML::POSTResource>, bool, Web::Bindings::NavigationHistoryBehavior) override;
+    virtual void page_did_cancel_loading(Optional<String> const&, URL::URL const&) override;
     virtual void page_did_create_new_document(Web::DOM::Document&) override;
     virtual void page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document&) override;
-    virtual void page_did_finish_loading(URL::URL const&) override;
+    virtual void page_did_finish_loading(Optional<String> const&, URL::URL const&) override;
     virtual Optional<u64> page_did_start_download(URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data) override;
     virtual Optional<u64> page_did_start_download(URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size) override;
     virtual void page_did_receive_download_data(u64 download_id, ByteBuffer data) override;
@@ -256,9 +259,10 @@ private:
     virtual void page_did_request_primary_paste() override;
     virtual void page_did_update_primary_selection(String const&) override;
     virtual void page_did_change_audio_play_state(Web::HTML::AudioPlayState) override;
+    virtual void page_did_change_screen_wake_lock_state(Web::ScreenWakeLockState) override;
     virtual Web::HTML::WorkerAgentId start_worker_agent(Web::HTML::WorkerAgentStartRequest&&) override;
     virtual void close_worker_agent(Web::HTML::WorkerAgentId, Web::HTML::WorkerAgentOwnerToken) override;
-    virtual void page_did_mutate_dom(FlyString const& type, Web::DOM::Node const& target, Web::DOM::NodeList& added_nodes, Web::DOM::NodeList& removed_nodes, GC::Ptr<Web::DOM::Node> previous_sibling, GC::Ptr<Web::DOM::Node> next_sibling, Optional<String> const& attribute_name) override;
+    virtual void page_did_mutate_dom(FlyString const& type, Web::DOM::Node const& target, Web::DOM::NodeList& added_nodes, Web::DOM::NodeList& removed_nodes, GC::Ptr<Web::DOM::Node> previous_sibling, GC::Ptr<Web::DOM::Node> next_sibling, Optional<Utf16FlyString> const& attribute_name) override;
     virtual void flush_pending_dom_mutations() override;
     virtual void page_did_take_screenshot(Gfx::ShareableBitmap const& screenshot) override;
     virtual void received_message_from_web_ui(String const& name, JS::Value data) override;
@@ -309,7 +313,8 @@ private:
     RefPtr<Core::Timer> m_frame_timer;
     Optional<double> m_last_frame_dispatch_time;
     Queue<PendingDOMMutation> m_pending_dom_mutations;
-    HashMap<String, Web::Compositor::CompositorContextId> m_remote_child_frame_compositor_contexts;
+    HashMap<Web::HTML::NavigableId, Web::Compositor::CompositorContextId> m_remote_child_frame_compositor_contexts;
+    Optional<Web::HTML::NavigableId> m_pending_root_navigable_id;
 
     u64 m_devtools_client_count { 0 };
 };

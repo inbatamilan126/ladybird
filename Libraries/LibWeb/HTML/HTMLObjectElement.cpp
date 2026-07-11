@@ -94,7 +94,7 @@ void HTMLObjectElement::adopted_from(DOM::Document& old_document)
         delayer = DOM::DocumentLoadEventDelayer { document() };
 }
 
-void HTMLObjectElement::form_associated_element_attribute_changed(FlyString const& name, Optional<String> const&, Optional<String> const&, Optional<FlyString> const&)
+void HTMLObjectElement::form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const&, Optional<Utf16String> const&, Optional<Utf16FlyString> const&)
 {
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element
     // Whenever one of the following conditions occur:
@@ -116,7 +116,7 @@ void HTMLObjectElement::form_associated_element_was_removed(DOM::Node*)
     destroy_the_child_navigable();
 }
 
-bool HTMLObjectElement::is_presentational_hint(FlyString const& name) const
+bool HTMLObjectElement::is_presentational_hint(Utf16FlyString const& name) const
 {
     if (Base::is_presentational_hint(name))
         return true;
@@ -198,7 +198,7 @@ String HTMLObjectElement::data() const
     return maybe_url->to_string();
 }
 
-void HTMLObjectElement::set_data(String const& data)
+void HTMLObjectElement::set_data(Utf16String const& data)
 {
     set_attribute_value(HTML::AttributeNames::data, data);
 }
@@ -414,8 +414,8 @@ void HTMLObjectElement::resource_did_load(Fetch::Infrastructure::Response const&
         else if (auto type = this->type(); !type.is_empty() && (type != "application/octet-stream"sv)) {
             // 1. If the attribute's value is a type that starts with "image/" that is not also an XML MIME type, then
             //    let the resource type be the type specified in that type attribute.
-            if (type.starts_with_bytes("image/"sv)) {
-                auto parsed_type = MimeSniff::MimeType::parse(type);
+            if (type.starts_with(u"image/"sv)) {
+                auto parsed_type = MimeSniff::MimeType::parse(type.to_utf8());
 
                 if (parsed_type.has_value() && !parsed_type->is_xml())
                     resource_type = move(parsed_type);
@@ -468,7 +468,7 @@ void HTMLObjectElement::run_object_representation_handler_steps(Fetch::Infrastru
         // If response's URL does not match about:blank, then navigate the element's content navigable to response's URL
         // using the element's node document, with historyHandling set to "replace".
         if (response.url().has_value() && !url_matches_about_blank(*response.url())) {
-            MUST(m_content_navigable->navigate({
+            MUST(as<HTML::LocalNavigable>(*m_content_navigable).navigate({
                 .url = *response.url(),
                 .source_document = document(),
                 .history_handling = Bindings::NavigationHistoryBehavior::Replace,

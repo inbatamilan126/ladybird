@@ -12,6 +12,8 @@
 #include <AK/OwnPtr.h>
 #include <AK/String.h>
 #include <AK/Tuple.h>
+#include <AK/Utf16String.h>
+#include <AK/Utf16View.h>
 #include <LibCore/Forward.h>
 #include <LibWeb/Bindings/Navigation.h>
 #include <LibWeb/Compositor/CompositorHost.h>
@@ -27,6 +29,7 @@
 #include <LibWeb/HTML/NavigationParams.h>
 #include <LibWeb/HTML/POSTResource.h>
 #include <LibWeb/HTML/PaintConfig.h>
+#include <LibWeb/HTML/ReplicatedNavigableState.h>
 #include <LibWeb/HTML/SandboxingFlagSet.h>
 #include <LibWeb/HTML/SourceSnapshotParams.h>
 #include <LibWeb/HTML/StructuredSerializeTypes.h>
@@ -73,6 +76,7 @@ public:
     using NavigationParamsVariant = Variant<NullOrError, GC::Ref<NavigationParams>, GC::Ref<NonFetchSchemeNavigationParams>>;
 
     void initialize_navigable(NonnullRefPtr<DocumentState> document_state, GC::Ptr<LocalNavigable> parent, GC::Ref<DOM::Document> document);
+    void set_id_for_session_history_reconstruction(NavigableId id) { set_id(id); }
 
     void register_navigation_observer(Badge<NavigationObserver>, NavigationObserver&);
     void unregister_navigation_observer(Badge<NavigationObserver>, NavigationObserver&);
@@ -111,6 +115,7 @@ public:
 
     virtual Optional<URL::URL> active_document_url() const override;
     virtual Optional<URL::Origin> active_document_origin() const override;
+    ReplicatedNavigableState replicated_state() const;
 
     RefPtr<SessionHistoryEntry> get_the_target_history_entry(int target_step) const;
     RefPtr<SessionHistoryEntry> get_the_target_history_entry_if_present(int target_step) const;
@@ -119,7 +124,7 @@ public:
     void restore_persisted_state_from_session_history_entry(SessionHistoryEntry const&);
     void restore_scroll_position_data(SessionHistoryEntry const&);
 
-    virtual String target_name() const override;
+    virtual Utf16String target_name() const override;
 
     GC::Ptr<NavigableContainer> container() const;
     GC::Ptr<DOM::Document> container_document() const;
@@ -137,7 +142,7 @@ public:
 
     ChosenNavigable choose_a_navigable(StringView name, TokenizedFeature::NoOpener no_opener, ActivateTab = ActivateTab::Yes, Optional<TokenizedFeature::Map const&> window_features = {});
 
-    GC::Ptr<LocalNavigable> find_a_navigable_by_target_name(StringView name);
+    GC::Ptr<LocalNavigable> find_a_navigable_by_target_name(Utf16View name);
 
     enum class Traversal {
         Tag
@@ -164,7 +169,7 @@ public:
         Optional<URL::Origin> origin,
         Variant<SerializedPolicyContainer, DocumentState::Client> history_policy_container,
         Optional<URL::URL> about_base_url,
-        String navigable_target_name,
+        Utf16String navigable_target_name,
         bool reload_pending,
         bool ever_populated,
         GC::Ref<SourceSnapshotParams> source_snapshot_params,

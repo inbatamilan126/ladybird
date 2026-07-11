@@ -93,7 +93,7 @@ public:
     bool suffering_from_a_custom_error() const;
 
     virtual Utf16String form_value() const { return {}; }
-    virtual Optional<String> optional_value() const { VERIFY_NOT_REACHED(); }
+    virtual Optional<Utf16String> optional_value() const { VERIFY_NOT_REACHED(); }
 
     virtual HTMLElement& form_associated_element_to_html_element() = 0;
     HTMLElement const& form_associated_element_to_html_element() const { return const_cast<FormAssociatedElement&>(*this).form_associated_element_to_html_element(); }
@@ -104,7 +104,7 @@ public:
     virtual void clear_algorithm();
 
     String form_action() const;
-    void set_form_action(String const&);
+    void set_form_action(Utf16String const&);
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-cva-reportvalidity
     bool report_validity();
@@ -154,12 +154,12 @@ protected:
     virtual void form_associated_element_was_inserted();
     virtual void form_associated_element_was_removed(DOM::Node*);
     virtual void form_associated_element_was_moved(GC::Ptr<DOM::Node>);
-    virtual void form_associated_element_attribute_changed(FlyString const&, Optional<String> const&, Optional<String> const&, Optional<FlyString> const&);
+    virtual void form_associated_element_attribute_changed(Utf16FlyString const&, Optional<Utf16String> const&, Optional<Utf16String> const&, Optional<Utf16FlyString> const&);
 
     void form_node_was_inserted();
     void form_node_was_removed();
     void form_node_was_moved();
-    void form_node_attribute_changed(FlyString const&, Optional<String> const&);
+    void form_node_attribute_changed(Utf16FlyString const&, Optional<Utf16String> const&);
 
     void visit_edges(JS::Cell::Visitor&);
 
@@ -257,10 +257,11 @@ public:
     virtual GC::Ptr<DOM::Element> text_control_scroll_container() = 0;
 
     virtual void handle_insert(FlyString const& input_type, Utf16String const&) override;
-    virtual void handle_delete(FlyString const& input_type) override;
+    virtual void handle_delete(FlyString const& input_type, DispatchInputEvent = DispatchInputEvent::Yes) override;
+    virtual GC::Ptr<DOM::Node> mouse_selection_scope() override;
     virtual void select_all() override;
-    virtual void set_selection_anchor(GC::Ref<DOM::Node>, size_t offset) override;
-    virtual void set_selection_focus(GC::Ref<DOM::Node>, size_t offset) override;
+    virtual void set_selection_anchor(GC::Ref<DOM::Node>, size_t offset, TextAffinity = TextAffinity::Downstream) override;
+    virtual void set_selection_focus(GC::Ref<DOM::Node>, size_t offset, TextAffinity = TextAffinity::Downstream) override;
     virtual void move_cursor_to_start(CollapseSelection) override;
     virtual void move_cursor_to_end(CollapseSelection) override;
     void move_cursor_to_start_of_current_line(CollapseSelection);
@@ -281,7 +282,8 @@ protected:
 private:
     virtual GC::Ref<JS::Cell> as_cell() override;
 
-    void collapse_selection_to_offset(size_t);
+    void collapse_selection_to_offset(size_t, TextAffinity = TextAffinity::Downstream);
+    void move_selection_end_to(size_t offset, TextAffinity, CollapseSelection);
     void scroll_cursor_into_view();
     void selection_was_changed(SelectionSource);
 
@@ -289,6 +291,9 @@ private:
     WebIDL::UnsignedLong m_selection_start { 0 };
     WebIDL::UnsignedLong m_selection_end { 0 };
     SelectionDirection m_selection_direction { SelectionDirection::None };
+
+    // Disambiguates which visual line the selection end renders on when it sits at a soft wrap boundary.
+    TextAffinity m_selection_end_affinity { TextAffinity::Downstream };
 
     // https://w3c.github.io/selection-api/#dfn-has-scheduled-selectionchange-event
     bool m_has_scheduled_selectionchange_event { false };

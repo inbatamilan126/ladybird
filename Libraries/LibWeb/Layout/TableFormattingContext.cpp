@@ -44,39 +44,44 @@ CSSPixels TableFormattingContext::run_caption_layout(CSS::CaptionSide phase, Ava
         // Captions live inside the table wrapper, so their quirks percentage height basis derives
         // from the wrapper, not from anything the table box inherited.
         auto const& caption_constraints = m_participant_constraints;
+        bool caption_was_placed = false;
         // The caption boxes are principal block-level boxes that retain their own content, padding, margin, and border areas,
         // and are rendered as normal block boxes inside the table wrapper box, as described in https://www.w3.org/TR/CSS22/tables.html#model
         if (auto caption_context = create_independent_formatting_context_if_needed(m_state, m_layout_mode, child_box)) {
             auto inner_available_space = caption_available_space;
             auto* block_context = as_if<BlockFormattingContext>(caption_context.ptr());
+            CSSPixelPoint caption_offset;
             if (block_context) {
                 auto available_width = caption_available_space.width.to_px_or_zero();
                 block_context->resolve_vertical_box_model_metrics(child_box, available_width);
-                block_context->compute_width(child_box, caption_available_space, caption_constraints);
+                CSSPixelPoint caption_position_in_block_context {};
+                block_context->compute_width(child_box, caption_available_space, caption_constraints, caption_position_in_block_context);
                 inner_available_space = m_state.get(child_box).available_inner_space_or_constraints_from(caption_available_space);
+
+                auto const& caption_state = m_state.get(child_box);
+                caption_offset = { caption_state.border_box_left(), 0 };
+                if (phase == CSS::CaptionSide::Bottom)
+                    caption_offset.set_y(m_state.get(table_box()).margin_box_height() + caption_state.margin_box_top());
             }
 
             caption_context->run(LayoutInput { inner_available_space, caption_constraints });
 
             if (block_context) {
                 auto& caption_state = m_state.get_mutable(child_box);
-
-                // Adjust x offset so border-box aligns with the table wrapper.
-                caption_state.set_content_x(caption_state.offset.x() + caption_state.border_left + caption_state.padding_left);
-
                 if (should_treat_height_as_auto(child_box, caption_available_space, m_participant_constraints)) {
                     auto height = child_box.has_size_containment() ? 0 : caption_context->automatic_content_height();
                     caption_state.set_content_height(height);
                 }
+                place_child(child_box, caption_offset);
+                caption_was_placed = true;
             }
         }
 
         auto const& caption_state = m_state.get(child_box);
         if (phase == CSS::CaptionSide::Top) {
-            m_state.get_mutable(table_box()).set_content_y(caption_state.content_height() + caption_state.margin_box_bottom());
-        } else {
-            m_state.get_mutable(child_box).set_content_y(
-                m_state.get(table_box()).margin_box_height() + caption_state.margin_box_top());
+            m_pending_table_box_content_offset_in_wrapper.set_y(caption_state.content_height() + caption_state.margin_box_bottom());
+        } else if (!caption_was_placed) {
+            place_child(child_box, { caption_state.border_box_left(), m_state.get(table_box()).margin_box_height() + caption_state.margin_box_top() });
         }
         caption_height += caption_state.margin_box_height();
     }
@@ -221,7 +226,6 @@ void TableFormattingContext::compute_cell_measures(RowMeasurement row_measuremen
 void TableFormattingContext::compute_outer_content_sizes()
 {
     auto containing_block_width = m_table_constraints.percentage_basis_width.value_or(0);
-    auto containing_block_height = m_table_constraints.percentage_basis_height.value_or(0);
 
     size_t column_index = 0;
     TableGrid::for_each_child_box_matching(table_box(), is_table_column_group, [&](auto& column_group_box) {
@@ -239,6 +243,13 @@ void TableFormattingContext::compute_outer_content_sizes()
             column_index += span;
         });
     });
+
+    initialize_row_content_sizes();
+}
+
+void TableFormattingContext::initialize_row_content_sizes()
+{
+    auto containing_block_height = m_table_constraints.percentage_basis_height.value_or(0);
 
     for (auto& row : m_rows) {
         auto const& computed_values = row.box.computed_values();
@@ -1027,6 +1038,14 @@ void TableFormattingContext::compute_table_height()
             cell_state.set_content_height(independent_formatting_context->automatic_content_height());
             independent_formatting_context->parent_context_did_dimension_child_root_box();
         }
+        if (m_needs_fixed_mode_row_measurement) {
+            auto const& computed_values = cell.box.computed_values();
+            auto min_height = computed_values.min_height().to_px(height_of_containing_block);
+            auto cell_intrinsic_height_offsets = cell_state.border_box_top() + cell_state.border_box_bottom();
+            auto measured_outer_height = max(cell_state.border_box_height(), min_height + cell_intrinsic_height_offsets);
+            cell.outer_min_height = measured_outer_height;
+            cell.outer_max_height = measured_outer_height;
+        }
 
         // https://drafts.csswg.org/css2/#height-layout
         // The baseline of a cell is the baseline of the first in-flow line box in the cell, or the first in-flow
@@ -1044,8 +1063,18 @@ void TableFormattingContext::compute_table_height()
             if (cell.row_span == 1) {
                 row.base_height = max(row.base_height, cell_state.border_box_height());
             }
-            row.base_height = max(row.base_height, m_rows[cell.row_index].min_size);
+            if (!m_needs_fixed_mode_row_measurement)
+                row.base_height = max(row.base_height, m_rows[cell.row_index].min_size);
             row.baseline = max(row.baseline, cell.baseline);
+        }
+    }
+
+    if (m_needs_fixed_mode_row_measurement) {
+        initialize_row_content_sizes();
+        compute_table_measures<Row>();
+        for (auto& row : m_rows) {
+            if (!row.is_collapsed)
+                row.base_height = max(row.base_height, row.min_size);
         }
     }
 
@@ -1204,7 +1233,7 @@ void TableFormattingContext::position_row_boxes()
 {
     auto const& table_state = m_state.get(table_box());
 
-    CSSPixels row_top_offset = table_state.offset.y() + border_spacing_vertical();
+    CSSPixels row_top_offset = m_pending_table_box_content_offset_in_wrapper.y() + border_spacing_vertical();
     CSSPixels row_left_offset = table_state.border_left + table_state.padding_left + border_spacing_horizontal();
     for (size_t y = 0; y < m_rows.size(); y++) {
         auto& row = m_rows[y];
@@ -1218,21 +1247,18 @@ void TableFormattingContext::position_row_boxes()
 
         row_state.set_content_height(row.final_height);
         row_state.set_content_width(row_width);
-        row_state.set_content_x(row_left_offset);
-        row_state.set_content_y(row_top_offset);
+        place_child(row.box, { row_left_offset, row_top_offset });
         if (!row.is_collapsed)
             row_top_offset += row_state.content_height() + border_spacing_vertical();
     }
 
-    CSSPixels row_group_top_offset = table_state.offset.y() + border_spacing_vertical();
+    CSSPixels row_group_top_offset = m_pending_table_box_content_offset_in_wrapper.y() + border_spacing_vertical();
     CSSPixels row_group_left_offset = table_state.border_left + table_state.padding_left + border_spacing_horizontal();
     TableGrid::for_each_child_box_matching(table_box(), TableGrid::is_table_row_group, [&](auto& row_group_box) {
         CSSPixels row_group_height = 0;
         CSSPixels row_group_width = 0;
 
         auto& row_group_box_state = m_state.get_mutable(row_group_box);
-        row_group_box_state.set_content_x(row_group_left_offset);
-        row_group_box_state.set_content_y(row_group_top_offset);
 
         int num_rows = 0;
         TableGrid::for_each_child_box_matching(row_group_box, TableGrid::is_table_row, [&](auto& row) {
@@ -1246,11 +1272,12 @@ void TableFormattingContext::position_row_boxes()
 
         row_group_box_state.set_content_height(row_group_height);
         row_group_box_state.set_content_width(row_group_width);
+        place_child(row_group_box, { row_group_left_offset, row_group_top_offset });
 
         row_group_top_offset += row_group_height + (num_rows > 0 ? border_spacing_vertical() : 0);
     });
 
-    auto total_content_height = max(row_top_offset, row_group_top_offset) - table_state.offset.y() - table_state.padding_top;
+    auto total_content_height = max(row_top_offset, row_group_top_offset) - m_pending_table_box_content_offset_in_wrapper.y() - table_state.padding_top;
     m_table_height = max(total_content_height, m_table_height);
 }
 
@@ -1326,9 +1353,10 @@ void TableFormattingContext::position_cell_boxes()
         // - for top: the height reserved for top captions (including margins), if any
         // - the padding-left/padding-top and border-left-width/border-top-width of the table
         // FIXME: Account for visibility.
-        cell_state.set_content_offset(row_state.offset.translated(
+        auto cell_offset = row_state.content_offset().translated(
             cell_state.border_box_left() + m_columns[cell.column_index].left_offset + cell.column_index * border_spacing_horizontal(),
-            cell_state.border_box_top()));
+            cell_state.border_box_top());
+        place_child(cell.box, cell_offset);
     }
 }
 
@@ -1783,8 +1811,12 @@ void TableFormattingContext::seed_table_participant_used_values(ContainingBlockC
         m_state.create(cell.box, participant_percentage_basis.percentage_basis_width, participant_percentage_basis.percentage_basis_height);
 
     for (auto child = table_box().first_child(); child; child = child->next_sibling()) {
-        if (child->display().is_table_caption())
-            m_state.create(as<Box>(*child), participant_percentage_basis.percentage_basis_width, participant_percentage_basis.percentage_basis_height);
+        auto* child_box = as_if<Box>(*child);
+        if (!child_box)
+            continue;
+
+        if (child_box->display().is_table_caption())
+            m_state.create(*child_box, participant_percentage_basis.percentage_basis_width, participant_percentage_basis.percentage_basis_height);
     }
 }
 
@@ -1811,10 +1843,22 @@ void TableFormattingContext::run_until_width_calculation(LayoutInput const& layo
     border_conflict_resolution();
 
     auto effective_row_measurement = row_measurement;
+    m_needs_fixed_mode_row_measurement = false;
     // OPTIMIZATION: Row intrinsic measurements are only needed when row height constraints or rowspans can affect
     //               the later row height distribution. Simple tables get their actual row heights from cell layout.
     if (effective_row_measurement == RowMeasurement::Include && can_skip_row_intrinsic_measurement())
         effective_row_measurement = RowMeasurement::Skip;
+    if (effective_row_measurement == RowMeasurement::Include && use_fixed_mode_layout()) {
+        // https://drafts.csswg.org/css-tables-3/#computing-column-measures
+        // For the purpose of measuring a column when laid out in fixed mode ... the min-content and max-content width
+        // of cells is considered zero.
+        //
+        // https://drafts.csswg.org/css-tables-3/#ROWMIN
+        // ROWMIN is defined as the sum of the minimum height of the rows after a first row layout pass.
+        // NB: So defer fixed-mode row measurement until after columns have their used widths.
+        effective_row_measurement = RowMeasurement::Skip;
+        m_needs_fixed_mode_row_measurement = true;
+    }
 
     // Compute the minimum width of each column.
     compute_cell_measures(effective_row_measurement);
@@ -1842,10 +1886,9 @@ void TableFormattingContext::parent_context_did_dimension_child_root_box()
 
     context_box().for_each_in_subtree_of_type<Box const>([&](Layout::Box const& box) {
         if (box.is_absolutely_positioned()) {
-            // FIXME: calculate_static_position_rect() is not aware of how to correctly calculate static position for
-            //        a box nested inside a table, but we need to set some value, so layout_absolutely_positioned_element()
-            //        won't crash trying to access it.
-            m_state.create(box, {}, {}).set_static_position_rect(calculate_static_position_rect(box));
+            // FIXME: Calculate the real static position for a box nested inside a table
+            //        instead of registering a zero rect.
+            register_contained_abspos_child(box, {});
         }
 
         if (formatting_context_type_created_by_box(box).has_value()) {
@@ -2092,14 +2135,6 @@ CSSPixels TableFormattingContext::border_spacing_vertical() const
     if (computed_values.border_collapse() == CSS::BorderCollapse::Collapse)
         return 0;
     return computed_values.border_spacing_vertical();
-}
-
-StaticPositionRect TableFormattingContext::calculate_static_position_rect(Box const&) const
-{
-    // FIXME: Implement static position calculation for table descendants instead of always returning a rectangle with zero position and size.
-    StaticPositionRect static_position;
-    static_position.rect = { { 0, 0 }, { 0, 0 } };
-    return static_position;
 }
 
 template<>

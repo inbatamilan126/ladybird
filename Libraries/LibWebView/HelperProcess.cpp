@@ -82,7 +82,7 @@ static ErrorOr<NonnullRefPtr<ClientType>> launch_server_process(
     VERIFY_NOT_REACHED();
 }
 
-ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(IsPrivate is_private, u64 initial_page_id)
+ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(IsPrivate is_private, u64 initial_page_id, Web::HTML::NavigableId root_navigable_id)
 {
     auto const& browser_options = WebView::Application::browser_options();
     auto const& web_content_options = WebView::Application::web_content_options();
@@ -142,7 +142,11 @@ ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(IsP
         arguments.append("--mach-server-name"sv);
         arguments.append(server.value());
     }
-    return launch_server_process<WebView::WebContentClient>("WebContent"sv, move(arguments), is_private, initial_page_id);
+
+    auto client = TRY(launch_server_process<WebView::WebContentClient>("WebContent"sv, move(arguments), is_private, initial_page_id, root_navigable_id));
+    if (auto system_font_family = WebView::Application::the().system_font_family(); system_font_family.has_value())
+        client->async_set_system_font_family(system_font_family.release_value());
+    return client;
 }
 
 ErrorOr<NonnullRefPtr<ImageDecoderClient::Client>> launch_image_decoder_process()
@@ -168,6 +172,8 @@ ErrorOr<NonnullRefPtr<WebView::CompositorClient>> launch_compositor_process()
     Vector<ByteString> arguments;
     if (browser_options.disable_sandbox == DisableSandbox::Yes)
         arguments.append("--disable-sandbox"sv);
+    if (web_content_options.is_test_mode == WebView::IsTestMode::Yes)
+        arguments.append("--test-mode"sv);
     if (web_content_options.force_cpu_painting == WebView::ForceCPUPainting::Yes)
         arguments.append("--force-cpu-painting"sv);
     if (web_content_options.force_fontconfig == WebView::ForceFontconfig::Yes)
@@ -218,7 +224,10 @@ ErrorOr<NonnullRefPtr<WebWorkerClient>> launch_web_worker_process(Web::Bindings:
         arguments.append(server.value());
     }
 
-    return launch_server_process<WebWorkerClient>("WebWorker"sv, move(arguments), is_private, agent_id);
+    auto client = TRY(launch_server_process<WebWorkerClient>("WebWorker"sv, move(arguments), is_private, agent_id));
+    if (auto system_font_family = WebView::Application::the().system_font_family(); system_font_family.has_value())
+        client->async_set_system_font_family(system_font_family.release_value());
+    return client;
 }
 
 ErrorOr<NonnullRefPtr<Requests::RequestClient>> launch_request_server_process()

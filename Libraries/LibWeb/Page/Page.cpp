@@ -51,6 +51,19 @@ Page::Page(GC::Ref<PageClient> client)
 
 Page::~Page() = default;
 
+void Page::acquire_screen_wake_lock()
+{
+    if (m_active_screen_wake_lock_count++ == 0)
+        client().page_did_change_screen_wake_lock_state(ScreenWakeLockState::Acquired);
+}
+
+void Page::release_screen_wake_lock()
+{
+    VERIFY(m_active_screen_wake_lock_count > 0);
+    if (--m_active_screen_wake_lock_count == 0)
+        client().page_did_change_screen_wake_lock_state(ScreenWakeLockState::Released);
+}
+
 bool Page::has_compositor_host() const
 {
     return m_client->compositor_host();
@@ -341,6 +354,13 @@ EventResult Page::handle_mouseleave()
 {
     return top_level_traversable()->event_handler().handle_mouseleave();
 }
+
+#if defined(AK_OS_MACOS)
+bool Page::select_word_for_dictionary_lookup(DevicePixelPoint position)
+{
+    return top_level_traversable()->event_handler().select_word_for_dictionary_lookup(device_to_css_point(position));
+}
+#endif
 
 UniqueNodeID Page::node_id_at_position(DevicePixelPoint position)
 {
@@ -716,6 +736,12 @@ void Page::prepare_canvas_contexts_for_compositing()
     for_each_canvas_element([](auto& canvas_element) {
         canvas_element.prepare_for_compositing();
     });
+
+    // Preparing only records commands and present markers into the shared
+    // canvas command stream; flush it here so canvases reach the Compositor
+    // even when nothing else repaints this rendering update.
+    if (has_compositor_host())
+        compositor_host().flush_canvas_2d_stream();
 }
 
 void Page::notify_all_canvas_elements_of_lost_backing_storage()
@@ -777,7 +803,7 @@ void Page::toggle_media_loop_state()
     if (media_element->has_attribute(HTML::AttributeNames::loop))
         media_element->remove_attribute(HTML::AttributeNames::loop);
     else
-        media_element->set_attribute_value(HTML::AttributeNames::loop, String {});
+        media_element->set_attribute_value(HTML::AttributeNames::loop, Utf16String {});
 }
 
 void Page::toggle_media_fullscreen_state()
@@ -801,12 +827,15 @@ void Page::toggle_media_controls_state()
     if (media_element->has_attribute(HTML::AttributeNames::controls))
         media_element->remove_attribute(HTML::AttributeNames::controls);
     else
-        media_element->set_attribute_value(HTML::AttributeNames::controls, String {});
+        media_element->set_attribute_value(HTML::AttributeNames::controls, Utf16String {});
 }
 
-void Page::toggle_page_mute_state()
+void Page::set_page_mute_state(HTML::MuteState mute_state)
 {
-    m_mute_state = HTML::invert_mute_state(m_mute_state);
+    if (m_mute_state == mute_state)
+        return;
+
+    m_mute_state = mute_state;
 
     for_each_media_element([&](auto& media_element) {
         media_element.page_mute_state_changed({});

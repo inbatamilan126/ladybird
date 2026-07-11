@@ -577,24 +577,59 @@ void Application::open_url_in_new_tab(URL::URL const& url, Web::HTML::ActivateTa
         view->load(url);
 }
 
+void Application::open_urls_in_new_tabs(ReadonlySpan<URL::URL> urls) const
+{
+    for (auto const& url : urls)
+        open_url_in_new_tab(url, Web::HTML::ActivateTab::No);
+}
+
 void Application::open_bookmark_in_new_tab(String const& bookmark_id, Web::HTML::ActivateTab activate_tab) const
 {
     if (auto bookmark = m_bookmark_store.find_item_by_id(bookmark_id); bookmark.has_value() && bookmark->is_bookmark())
         open_url_in_new_tab(bookmark->bookmark().url, activate_tab);
 }
 
-void Application::open_url_in_new_window(URL::URL const& url)
+static void collect_bookmark_urls(BookmarkItem::Folder const& folder, Vector<URL::URL>& urls)
 {
-    dbgln("open_url_in_new_window() is unsupported on this platform (url: {})", url);
+    for (auto const& child : folder.children) {
+        child.data.visit(
+            [&](BookmarkItem::Bookmark const& bookmark) {
+                urls.append(bookmark.url);
+            },
+            [&](BookmarkItem::Folder const& child_folder) {
+                collect_bookmark_urls(child_folder, urls);
+            });
+    }
 }
 
-ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(Optional<ViewImplementation&> view, IsPrivate is_private, u64 initial_page_id)
+void Application::open_bookmark_folder_in_new_tabs(String const& folder_id) const
+{
+    auto folder = m_bookmark_store.find_item_by_id(folder_id);
+    if (!folder.has_value() || !folder->is_folder())
+        return;
+
+    Vector<URL::URL> urls;
+    collect_bookmark_urls(folder->folder(), urls);
+
+    open_urls_in_new_tabs(urls);
+}
+
+void Application::open_bookmark_in_new_window(String const& bookmark_id, IsPrivate is_private)
+{
+    if (auto bookmark = m_bookmark_store.find_item_by_id(bookmark_id); bookmark.has_value() && bookmark->is_bookmark())
+        open_url_in_new_window(bookmark->bookmark().url, is_private);
+}
+
+ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(Optional<ViewImplementation&> view, IsPrivate is_private, u64 initial_page_id, Optional<Web::HTML::NavigableId> root_navigable_id)
 {
     auto request_server_handle = TRY(connect_new_request_server_client(is_private));
     auto image_decoder_handle = TRY(connect_new_image_decoder_client());
 
-    auto client = TRY(WebView::launch_web_content_process(is_private, initial_page_id));
-    client->async_initialize(initial_page_id);
+    auto navigable_id_allocator = allocate_navigable_id_allocator();
+    auto root_id = root_navigable_id.value_or(navigable_id_allocator.allocate());
+
+    auto client = TRY(WebView::launch_web_content_process(is_private, initial_page_id, root_id));
+    client->async_initialize(initial_page_id, root_id, navigable_id_allocator);
     if (view.has_value())
         client->assign_view({}, *view);
 
@@ -609,6 +644,12 @@ u64 Application::allocate_page_id()
 {
     VERIFY(m_next_page_or_compositor_context_id > 0);
     return m_next_page_or_compositor_context_id++;
+}
+
+Web::HTML::NavigableIdAllocator Application::allocate_navigable_id_allocator()
+{
+    VERIFY(m_next_navigable_id_namespace > 0);
+    return Web::HTML::NavigableIdAllocator { .namespace_id = m_next_navigable_id_namespace++ };
 }
 
 PrivateBrowsingSession& Application::ensure_private_browsing_session()
@@ -652,6 +693,12 @@ void Application::maybe_close_private_browsing_session()
     if (has_private_client)
         return;
 
+    m_private_browsing_session = nullptr;
+}
+
+void Application::reset_private_browsing_session()
+{
+    m_file_downloader.cancel_private_downloads();
     m_private_browsing_session = nullptr;
 }
 
@@ -814,10 +861,10 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::launch_web_content_process
     return create_web_content_client(view, IsPrivate::No, allocate_page_id());
 }
 
-ErrorOr<Application::ChildFrameWebContentProcess> Application::launch_child_frame_web_content_process(IsPrivate is_private)
+ErrorOr<Application::ChildFrameWebContentProcess> Application::launch_child_frame_web_content_process(IsPrivate is_private, Web::HTML::NavigableId root_navigable_id)
 {
     auto page_id = allocate_page_id();
-    auto client = TRY(create_web_content_client({}, is_private, page_id));
+    auto client = TRY(create_web_content_client({}, is_private, page_id, root_navigable_id));
     return ChildFrameWebContentProcess {
         .client = move(client),
         .page_id = page_id,
@@ -1697,11 +1744,11 @@ void Application::initialize_actions()
     update_bookmark_action_for_current_web_view();
 
     m_bookmarks_menu->add_action(Action::create("Bookmark All Tabs..."sv, ActionID::AddBookmarkAllTabs, [this]() {
-        auto bookmarks = bookmarks_for_all_tabs();
+        auto bookmarks = bookmarks_for_all_tabs_in_current_window();
         if (bookmarks.is_empty())
             return;
 
-        auto default_title = suggested_bookmark_all_tabs_folder_title();
+        auto default_title = MUST(UnixDateTime::now().to_string("Saved Tabs %Y-%m-%d"sv));
         display_add_bookmark_folder_dialog(default_title)
             ->when_resolved([this, bookmarks = move(bookmarks)](BookmarkItem::Folder folder) mutable {
                 auto folder_id = m_bookmark_store.add_folder(move(folder.title));
@@ -1719,96 +1766,6 @@ void Application::initialize_actions()
     m_bookmarks_menu->add_separator();
     m_bookmarks_menu_static_size = m_bookmarks_menu->size();
     create_bookmark_menu_items();
-
-    auto add_bookmark_action = Action::create("Add Bookmark..."sv, ActionID::AddBookmark, [this]() {
-        auto bookmark_id = bookmark_item_id_for_context_menu();
-        if (!bookmark_id.has_value())
-            return;
-
-        display_add_bookmark_dialog(bookmark_id->target_folder_id)
-            ->when_resolved([this](AddBookmarkDialogResult result) {
-                m_bookmark_store.add_bookmark(move(result.bookmark.url), move(result.bookmark.title), move(result.bookmark.favicon_base64_png), move(result.target_folder_id));
-            });
-    });
-    auto add_bookmark_folder_action = Action::create("Add Folder..."sv, ActionID::AddBookmarkFolder, [this]() {
-        auto bookmark_id = bookmark_item_id_for_context_menu();
-        if (!bookmark_id.has_value())
-            return;
-
-        display_add_bookmark_folder_dialog()
-            ->when_resolved([this, bookmark_id = bookmark_id.release_value()](BookmarkItem::Folder folder) {
-                m_bookmark_store.add_folder(move(folder.title), bookmark_id.target_folder_id);
-            });
-    });
-
-    m_bookmarks_bar_context_menu = Menu::create("Bookmarks Bar Context Menu"sv);
-    m_bookmarks_bar_context_menu->add_action(add_bookmark_action);
-    m_bookmarks_bar_context_menu->add_action(add_bookmark_folder_action);
-
-    m_bookmark_context_menu = Menu::create("Bookmark Context Menu"sv);
-    m_bookmark_context_menu->add_action(Action::create("Open in New Tab"sv, ActionID::OpenInNewTab, [this]() {
-        auto bookmark_id = bookmark_item_id_for_context_menu();
-        if (!bookmark_id.has_value())
-            return;
-
-        open_bookmark_in_new_tab(bookmark_id->id, Web::HTML::ActivateTab::Yes);
-    }));
-    m_bookmark_context_menu->add_action(Action::create("Copy URL"sv, ActionID::CopyURL, [this]() {
-        auto bookmark_id = bookmark_item_id_for_context_menu();
-        if (!bookmark_id.has_value())
-            return;
-
-        auto bookmark = m_bookmark_store.find_item_by_id(bookmark_id->id);
-        if (!bookmark.has_value() || !bookmark->is_bookmark())
-            return;
-
-        insert_clipboard_entry({ url_text_to_copy(bookmark->bookmark().url), "text/plain"_string });
-    }));
-    m_bookmark_context_menu->add_separator();
-    m_bookmark_context_menu->add_action(Action::create("Edit Bookmark..."sv, ActionID::EditBookmark, [this]() {
-        auto bookmark_id = bookmark_item_id_for_context_menu();
-        if (!bookmark_id.has_value())
-            return;
-
-        auto current_bookmark = m_bookmark_store.find_item_by_id(bookmark_id->id);
-        if (!current_bookmark.has_value() || !current_bookmark->is_bookmark())
-            return;
-
-        display_edit_bookmark_dialog(current_bookmark->bookmark())
-            ->when_resolved([this, bookmark_id = bookmark_id.release_value()](BookmarkItem::Bookmark bookmark) {
-                m_bookmark_store.edit_bookmark(bookmark_id.id, move(bookmark.url), move(bookmark.title));
-            });
-    }));
-    m_bookmark_context_menu->add_action(Action::create("Delete Bookmark"sv, ActionID::DeleteBookmark, [this]() {
-        if (auto bookmark_id = bookmark_item_id_for_context_menu(); bookmark_id.has_value())
-            m_bookmark_store.remove_item(bookmark_id->id);
-    }));
-    m_bookmark_context_menu->add_separator();
-    m_bookmark_context_menu->add_action(add_bookmark_action);
-    m_bookmark_context_menu->add_action(add_bookmark_folder_action);
-
-    m_bookmark_folder_context_menu = Menu::create("Bookmark Folder Context Menu"sv);
-    m_bookmark_folder_context_menu->add_action(Action::create("Edit Folder..."sv, ActionID::EditBookmarkFolder, [this]() {
-        auto bookmark_id = bookmark_item_id_for_context_menu();
-        if (!bookmark_id.has_value())
-            return;
-
-        auto current_folder = m_bookmark_store.find_item_by_id(bookmark_id->id);
-        if (!current_folder.has_value() || !current_folder->is_folder())
-            return;
-
-        display_edit_bookmark_folder_dialog(current_folder->folder())
-            ->when_resolved([this, bookmark_id = bookmark_id.release_value()](BookmarkItem::Folder folder) {
-                m_bookmark_store.edit_folder(bookmark_id.id, move(folder.title));
-            });
-    }));
-    m_bookmark_folder_context_menu->add_action(Action::create("Delete Folder"sv, ActionID::DeleteBookmarkFolder, [this]() {
-        if (auto bookmark_id = bookmark_item_id_for_context_menu(); bookmark_id.has_value())
-            m_bookmark_store.remove_item(bookmark_id->id);
-    }));
-    m_bookmark_folder_context_menu->add_separator();
-    m_bookmark_folder_context_menu->add_action(add_bookmark_action);
-    m_bookmark_folder_context_menu->add_action(add_bookmark_folder_action);
 
     m_history_menu = Menu::create("History"sv);
     m_history_menu->add_action(Action::create("View History"sv, ActionID::ViewHistory, [this]() {
@@ -2028,6 +1985,21 @@ void Application::create_bookmark_menu_items(Optional<MenuData> data)
     }
 }
 
+Vector<BookmarkItem::Bookmark> Application::bookmarks_for_all_tabs_in_current_window() const
+{
+    Vector<WebView::BookmarkItem::Bookmark> bookmarks;
+
+    for (auto& view : active_window_web_views()) {
+        bookmarks.append(WebView::BookmarkItem::Bookmark {
+            .url = view.url(),
+            .title = view.title().is_empty() ? Optional<String> {} : view.title().to_utf8(),
+            .favicon_base64_png = view.favicon_base64_png(),
+        });
+    }
+
+    return bookmarks;
+}
+
 template<typename T>
 static NonnullRefPtr<T> create_unsupported_rejection()
 {
@@ -2054,11 +2026,6 @@ NonnullRefPtr<Application::BookmarkFolderPromise> Application::display_add_bookm
 NonnullRefPtr<Application::BookmarkFolderPromise> Application::display_edit_bookmark_folder_dialog(BookmarkItem::Folder const&) const
 {
     return create_unsupported_rejection<BookmarkFolderPromise>();
-}
-
-String Application::suggested_bookmark_all_tabs_folder_title() const
-{
-    return "Saved Tabs"_string;
 }
 
 ErrorOr<void> Application::toggle_devtools_enabled()
@@ -2618,7 +2585,7 @@ void Application::set_dom_node_text(DevTools::TabDescription const& description,
     });
 }
 
-void Application::set_dom_node_tag(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, String const& value, OnDOMNodeEditComplete on_complete) const
+void Application::set_dom_node_tag(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, Utf16FlyString const& value, OnDOMNodeEditComplete on_complete) const
 {
     edit_dom_node(description, move(on_complete), [&](auto& view) {
         view.set_dom_node_tag(node_id, value);
@@ -2632,7 +2599,7 @@ void Application::add_dom_node_attributes(DevTools::TabDescription const& descri
     });
 }
 
-void Application::replace_dom_node_attribute(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, String const& name, ReadonlySpan<Attribute> replacement_attributes, OnDOMNodeEditComplete on_complete) const
+void Application::replace_dom_node_attribute(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, Utf16FlyString const& name, ReadonlySpan<Attribute> replacement_attributes, OnDOMNodeEditComplete on_complete) const
 {
     edit_dom_node(description, move(on_complete), [&](auto& view) {
         view.replace_dom_node_attribute(node_id, name, replacement_attributes);
@@ -2850,7 +2817,7 @@ void Application::listen_for_navigation_events(DevTools::TabDescription const& d
         return;
 
     ViewImplementation::NavigationListener listener;
-    listener.on_load_start = [on_started = move(on_started)](URL::URL const& url, bool) {
+    listener.on_load_start = [on_started = move(on_started)](URL::URL const& url) {
         on_started(url.to_string());
     };
     listener.on_load_finish = [view_id = view->view_id(), on_finished = move(on_finished)](URL::URL const& url) {

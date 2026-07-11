@@ -53,6 +53,7 @@
 #include <LibWeb/MediaSourceExtensions/MediaSource.h>
 #include <LibWeb/MimeSniff/MimeType.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Page/ScreenWakeLockHandle.h>
 #include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/WebIDL/Promise.h>
@@ -112,7 +113,7 @@ void HTMLMediaElement::initialize(JS::Realm& realm)
 
     m_document_observer->set_document_became_active([this]() {
         // AD-HOC: Restart the fetch from where the stream last received data so that playback can continue.
-        if (m_remote_fetch_data) {
+        if (m_remote_fetch_data && !m_waiting_for_an_implementation_defined_event_to_fetch_the_resource) {
             VERIFY(!m_remote_fetch_data->fetch_controller);
             if (m_remote_fetch_data->stream->next_chunk_start() != m_remote_fetch_data->stream->expected_size())
                 load_remote_resource(UntilEnd { m_remote_fetch_data->stream->next_chunk_start() });
@@ -125,6 +126,8 @@ void HTMLMediaElement::initialize(JS::Realm& realm)
 void HTMLMediaElement::finalize()
 {
     Base::finalize();
+
+    m_screen_wake_lock.clear();
 
     // Tear down the controls eagerly so the Core::Timer they own (and the
     // closures it captures) cannot fire during the window between this GC
@@ -182,9 +185,11 @@ void HTMLMediaElement::visit_edges(Cell::Visitor& visitor)
         });
     if (m_controls.has_value())
         m_controls->visit_edges(visitor);
+    if (m_screen_wake_lock.has_value())
+        m_screen_wake_lock->visit_edges(visitor);
 }
 
-void HTMLMediaElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void HTMLMediaElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
@@ -203,6 +208,13 @@ void HTMLMediaElement::attribute_changed(FlyString const& name, Optional<String>
             create_controls();
         else
             destroy_controls();
+    } else if (name == HTML::AttributeNames::preload || name == HTML::AttributeNames::autoplay) {
+        if (m_waiting_for_an_implementation_defined_event_to_fetch_the_resource
+            && !should_wait_for_an_implementation_defined_event_before_fetching_the_resource()) {
+            // NB: This is an implementation-defined event. See the NB in
+            //     wait_for_an_implementation_defined_event_before_fetching_the_resource().
+            continue_fetching_the_resource_after_an_implementation_defined_event();
+        }
     }
 }
 
@@ -264,11 +276,17 @@ void HTMLMediaElement::adopted_from(DOM::Document& old_document)
 
     if (m_delaying_the_load_event.has_value())
         m_delaying_the_load_event.emplace(document());
+
+    if (m_screen_wake_lock.has_value()) {
+        m_screen_wake_lock.clear();
+        update_screen_wake_lock();
+    }
 }
 
 void HTMLMediaElement::cancel_the_fetching_process()
 {
     m_current_fetch_generation++;
+    m_waiting_for_an_implementation_defined_event_to_fetch_the_resource = false;
     if (m_remote_fetch_data && m_remote_fetch_data->stream)
         m_remote_fetch_data->stream->close();
     m_remote_fetch_data.clear();
@@ -668,8 +686,8 @@ GC::Ref<TextTrack> HTMLMediaElement::add_text_track(Bindings::TextTrackKind kind
     //    label to label, its text track language to language, its text track readiness state to the text track loaded
     //    state, its text track mode to the text track hidden mode, and its text track list of cues to an empty list.
     text_track->set_kind(kind);
-    text_track->set_label(label);
-    text_track->set_language(language);
+    text_track->set_label(Utf16String::from_utf8(label));
+    text_track->set_language(Utf16String::from_utf8(language));
     text_track->set_readiness_state(TextTrack::ReadinessState::Loaded);
     text_track->set_mode(Bindings::TextTrackMode::Hidden);
     // FIXME: set text track list of cues to an empty list
@@ -819,9 +837,9 @@ public:
     {
         // 2. ⌛ Process candidate: If candidate does not have a src attribute, or if its src attribute's value is the
         //    empty string, then end the synchronous section, and jump down to the failed with elements step below.
-        String candidate_src;
+        Utf16String candidate_src;
         if (auto maybe_src = m_candidate->get_attribute(HTML::AttributeNames::src); maybe_src.has_value())
-            candidate_src = *maybe_src;
+            candidate_src = maybe_src.release_value();
 
         if (candidate_src.is_empty()) {
             failed_with_elements();
@@ -1199,19 +1217,84 @@ void HTMLMediaElement::load_url_resource(URL::URL const& url_record, Function<vo
     }));
     m_remote_fetch_data->failure_callback = move(failure_callback);
 
-    set_up_playback_manager_for_remote();
-
     load_remote_resource(EntireResource {});
+}
+
+// https://html.spec.whatwg.org/multipage/media.html#attr-media-preload
+bool HTMLMediaElement::preload_attribute_is_in_none_state() const
+{
+    auto preload = get_attribute(HTML::AttributeNames::preload);
+    return preload.has_value() && preload->equals_ignoring_ascii_case("none"sv);
+}
+
+bool HTMLMediaElement::should_wait_for_an_implementation_defined_event_before_fetching_the_resource() const
+{
+    if (!preload_attribute_is_in_none_state())
+        return false;
+
+    if (!paused())
+        return false;
+
+    if (is_eligible_for_autoplay() && is_allowed_to_play())
+        return false;
+
+    return true;
+}
+
+void HTMLMediaElement::wait_for_an_implementation_defined_event_before_fetching_the_resource(u32 fetch_generation)
+{
+    m_waiting_for_an_implementation_defined_event_to_fetch_the_resource = true;
+
+    // 1. Set the networkState to NETWORK_IDLE.
+    m_network_state = NetworkState::Idle;
+
+    // 2. Queue a media element task given the media element to fire an event named suspend at the element.
+    queue_a_media_element_task([fetch_generation](HTMLMediaElement& self) {
+        if (fetch_generation != self.m_current_fetch_generation
+            || !self.m_waiting_for_an_implementation_defined_event_to_fetch_the_resource) {
+            return;
+        }
+        self.dispatch_event(DOM::Event::create(self.realm(), HTML::EventNames::suspend));
+    });
+
+    // 3. Queue a media element task given the media element to set the element's delaying-the-load-event flag to false. This stops delaying
+    //    the load event.
+    queue_a_media_element_task([fetch_generation](HTMLMediaElement& self) {
+        if (fetch_generation != self.m_current_fetch_generation
+            || !self.m_waiting_for_an_implementation_defined_event_to_fetch_the_resource) {
+            return;
+        }
+        self.m_delaying_the_load_event.clear();
+    });
+
+    // 4. Wait for the task to be run.
+    // 5. Wait for an implementation-defined event (e.g., the user requesting that the media element begin playback).
+    // NB: Step 4 is implemented by letting the media element task queued above clear the load event delayer. Step 5 is
+    //     represented by m_waiting_for_an_implementation_defined_event_to_fetch_the_resource; the callers of
+    //     continue_fetching_the_resource_after_an_implementation_defined_event() provide our implementation-defined events.
+}
+
+void HTMLMediaElement::continue_fetching_the_resource_after_an_implementation_defined_event()
+{
+    if (!m_waiting_for_an_implementation_defined_event_to_fetch_the_resource)
+        return;
+
+    VERIFY(m_remote_fetch_data);
+    m_waiting_for_an_implementation_defined_event_to_fetch_the_resource = false;
+
+    // 6. Set the element's delaying-the-load-event flag back to true (this delays the load event again, in case it hasn't been fired yet).
+    if (document().readiness() != DocumentReadyState::Complete)
+        m_delaying_the_load_event.emplace(document());
+
+    // 7. Set the networkState to NETWORK_LOADING.
+    m_network_state = NetworkState::Loading;
+
+    run_remote_mode_resource_fetch_steps(EntireResource {}, ++m_current_fetch_generation);
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#concept-media-load-resource
 void HTMLMediaElement::load_remote_resource(ByteRange const& byte_range)
 {
-    auto& realm = this->realm();
-    auto& vm = realm.vm();
-
-    auto const& url_record = m_remote_fetch_data->url_record;
-
     auto fetch_generation = ++m_current_fetch_generation;
 
     // 1. Let mode be remote.
@@ -1226,145 +1309,154 @@ void HTMLMediaElement::load_remote_resource(ByteRange const& byte_range)
     // 5. Run the appropriate steps from the following list:
     // -> If mode is remote
     {
-        // FIXME: 1. Optionally, run the following substeps. This is the expected behavior if the user agent intends to not attempt to fetch the resource until
-        //           the user requests it explicitly (e.g. as a way to implement the preload attribute's none keyword).
-        //            1. Set the networkState to NETWORK_IDLE.
-        //            2. Queue a media element task given the media element to fire an event named suspend at the element.
-        //            3. Queue a media element task given the media element to set the element's delaying-the-load-event flag to false. This stops delaying
-        //               the load event.
-        //            4. Wait for the task to be run.
-        //            5. Wait for an implementation-defined event (e.g., the user requesting that the media element begin playback).
-        //            6. Set the element's delaying-the-load-event flag back to true (this delays the load event again, in case it hasn't been fired yet).
-        //            7. Set the networkState to NETWORK_LOADING.
-
-        // 2. Let destination be "audio" if the media element is an audio element, or "video" otherwise.
-        auto destination = is<HTMLAudioElement>(*this)
-            ? Fetch::Infrastructure::Request::Destination::Audio
-            : Fetch::Infrastructure::Request::Destination::Video;
-
-        // 3. Let request be the result of creating a potential-CORS request given current media resource's URL record, destination, and the current state
-        //    of the media element's crossorigin content attribute.
-        auto request = create_potential_CORS_request(vm, url_record, destination, m_crossorigin);
-
-        // 4. Set request's client to the media element's node document's relevant settings object.
-        request->set_client(&document().relevant_settings_object());
-
-        // 5. Set request's initiator type to destination.
-        request->set_initiator_type(destination == Fetch::Infrastructure::Request::Destination::Audio
-                ? Fetch::Infrastructure::Request::InitiatorType::Audio
-                : Fetch::Infrastructure::Request::InitiatorType::Video);
-
-        // 6. Let byteRange, which is "entire resource" or a (number, number or "until end") tuple, be the byte range required to satisfy missing data in
-        //    media data. This value is implementation-defined and may rely on codec, network conditions or other heuristics. The user-agent may determine
-        //    to fetch the resource in full, in which case byteRange would be "entire resource", to fetch from a byte offset until the end, in which case
-        //    byteRange would be (number, "until end"), or to fetch a range between two byte offsets, in which case byteRange would be a (number, number)
-        //    tuple representing the two offsets.
-        // NB: byte_range is passed as a parameter.
-
-        // 7. If byteRange is not "entire resource", then:
-        m_remote_fetch_data->offset = 0;
-
-        if (!byte_range.has<EntireResource>()) {
-            // 1. If byteRange[1] is "until end", then add a range header to request given byteRange[0].
-            if (byte_range.has<UntilEnd>()) {
-                auto const& range = byte_range.get<UntilEnd>();
-                request->add_range_header(range.first, {});
-                m_remote_fetch_data->offset = range.first;
-            } else {
-                // 2. Otherwise, add a range header to request given byteRange[0] and byteRange[1].
-                // NB: We don't currently have any need to request a range with a delimited end.
-                VERIFY_NOT_REACHED();
-            }
+        // 1. Optionally, run the following substeps. This is the expected behavior if the user agent intends to not attempt to fetch the resource until
+        //    the user requests it explicitly (e.g. as a way to implement the preload attribute's none keyword).
+        if (should_wait_for_an_implementation_defined_event_before_fetching_the_resource()) {
+            wait_for_an_implementation_defined_event_before_fetching_the_resource(fetch_generation);
+            return;
         }
 
-        // 8. Fetch request, with processResponse set to the following steps given response response:
-        Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {};
-
-        fetch_algorithms_input.process_response = [self = GC::Ref(*this), byte_range = move(byte_range), fetch_generation](auto response) mutable {
-            auto& fetch_data = self->m_remote_fetch_data;
-
-            // FIXME: If the response is CORS cross-origin, we must use its internal response to query any of its data. See:
-            //        https://github.com/whatwg/html/issues/9355
-            response = response->unsafe_response();
-
-            // 1. Let global be the media element's node document's relevant global object.
-            auto& global = self->document().realm().global_object();
-
-            if (auto content_length = response->header_list()->extract_length(); content_length.template has<u64>()) {
-                auto actual_length = fetch_data->offset + content_length.template get<u64>();
-                fetch_data->stream->set_expected_size(actual_length);
-            }
-
-            if (auto accept_ranges = response->header_list()->extract_header_list_values("Accept-Ranges"sv); accept_ranges.template has<Vector<ByteString>>())
-                fetch_data->accepts_byte_ranges = accept_ranges.template get<Vector<ByteString>>().contains([](auto const& units) { return units == "bytes"sv; });
-
-            // 4. If the result of verifying response given the current media resource and byteRange is false, then abort these steps.
-            // NOTE: We do this step before creating the updateMedia task so that we can invoke the failure callback.
-            auto maybe_verify_response_failure = self->verify_response_or_get_failure_reason(response, byte_range);
-            if (maybe_verify_response_failure.has_value()) {
-                fetch_data->stream->close();
-                fetch_data->failure_callback(maybe_verify_response_failure.value());
-                return;
-            }
-
-            // 2. Let updateMedia be to queue a media element task given the media element to run the first appropriate steps from the media data processing
-            //    steps list below. (A new task is used for this so that the work described below occurs relative to the appropriate media element event task
-            //    source rather than using the networking task source.)
-            auto update_media = GC::create_function(self->heap(), [weak_self = GC::Weak(self), fetch_generation](ByteBuffer media_data) mutable {
-                if (!weak_self)
-                    return;
-                if (fetch_generation != weak_self->m_current_fetch_generation)
-                    return;
-                auto& fetch_data = weak_self->m_remote_fetch_data;
-
-                // 6. Update the media data with the contents of response's unsafe response obtained in this fashion. response can be CORS-same-origin or
-                //    CORS-cross-origin; this affects whether subtitles referenced in the media data are exposed in the API and, for video elements, whether
-                //    a canvas gets tainted when the video is drawn on it.
-                fetch_data->stream->add_chunk_at(fetch_data->offset, media_data.bytes());
-                fetch_data->offset += media_data.size();
-
-                weak_self->queue_a_media_element_task([](HTMLMediaElement& self) {
-                    self.process_media_data(FetchingStatus::Ongoing);
-                });
-            });
-
-            // 3. Let processEndOfMedia be the following step: If the fetching process has completes without errors, including decoding the media data,
-            //    and if all of the data is available to the user agent without network access, then, the user agent must move on to the final step below.
-            //    This might never happen, e.g. when streaming an infinite resource such as web radio, or if the resource is longer than the user agent's
-            //    ability to cache data.
-            auto process_end_of_media = GC::create_function(self->heap(), [weak_self = GC::Weak(self), fetch_generation] {
-                if (!weak_self)
-                    return;
-                if (fetch_generation != weak_self->m_current_fetch_generation)
-                    return;
-
-                weak_self->m_remote_fetch_data->stream->close();
-                weak_self->queue_a_media_element_task([](HTMLMediaElement& self) {
-                    self.process_media_data(FetchingStatus::Complete);
-                });
-            });
-
-            // 5. Otherwise, incrementally read response's body given updateMedia, processEndOfMedia, an empty algorithm, and global.
-
-            // AD-HOC: We need to pass a non-empty error algorithm in order to invoke the requisite steps.
-            auto process_body_error = GC::create_function(self->heap(), [weak_self = GC::Weak(self), fetch_generation](JS::Value) {
-                if (!weak_self)
-                    return;
-                if (fetch_generation != weak_self->m_current_fetch_generation)
-                    return;
-
-                weak_self->m_remote_fetch_data->stream->close();
-                weak_self->queue_a_media_element_task([](HTMLMediaElement& self) {
-                    self.process_media_data(FetchingStatus::Interrupted);
-                });
-            });
-
-            VERIFY(response->body());
-            response->body()->incrementally_read(update_media, process_end_of_media, process_body_error, GC::Ref { global });
-        };
-
-        m_remote_fetch_data->fetch_controller = Fetch::Fetching::fetch(realm, request, Fetch::Infrastructure::FetchAlgorithms::create(vm, move(fetch_algorithms_input)));
+        run_remote_mode_resource_fetch_steps(byte_range, fetch_generation);
     }
+}
+
+void HTMLMediaElement::run_remote_mode_resource_fetch_steps(ByteRange byte_range, u32 fetch_generation)
+{
+    auto& realm = this->realm();
+    auto& vm = realm.vm();
+
+    auto const& url_record = m_remote_fetch_data->url_record;
+
+    if (!m_playback_manager)
+        set_up_playback_manager_for_remote();
+
+    // 2. Let destination be "audio" if the media element is an audio element, or "video" otherwise.
+    auto destination = is<HTMLAudioElement>(*this)
+        ? Fetch::Infrastructure::Request::Destination::Audio
+        : Fetch::Infrastructure::Request::Destination::Video;
+
+    // 3. Let request be the result of creating a potential-CORS request given current media resource's URL record, destination, and the current state
+    //    of the media element's crossorigin content attribute.
+    auto request = create_potential_CORS_request(vm, url_record, destination, m_crossorigin);
+
+    // 4. Set request's client to the media element's node document's relevant settings object.
+    request->set_client(&document().relevant_settings_object());
+
+    // 5. Set request's initiator type to destination.
+    request->set_initiator_type(destination == Fetch::Infrastructure::Request::Destination::Audio
+            ? Fetch::Infrastructure::Request::InitiatorType::Audio
+            : Fetch::Infrastructure::Request::InitiatorType::Video);
+
+    // 6. Let byteRange, which is "entire resource" or a (number, number or "until end") tuple, be the byte range required to satisfy missing data in
+    //    media data. This value is implementation-defined and may rely on codec, network conditions or other heuristics. The user-agent may determine
+    //    to fetch the resource in full, in which case byteRange would be "entire resource", to fetch from a byte offset until the end, in which case
+    //    byteRange would be (number, "until end"), or to fetch a range between two byte offsets, in which case byteRange would be a (number, number)
+    //    tuple representing the two offsets.
+    // NB: byte_range is passed as a parameter.
+
+    // 7. If byteRange is not "entire resource", then:
+    m_remote_fetch_data->offset = 0;
+
+    if (!byte_range.has<EntireResource>()) {
+        // 1. If byteRange[1] is "until end", then add a range header to request given byteRange[0].
+        if (byte_range.has<UntilEnd>()) {
+            auto const& range = byte_range.get<UntilEnd>();
+            request->add_range_header(range.first, {});
+            m_remote_fetch_data->offset = range.first;
+        } else {
+            // 2. Otherwise, add a range header to request given byteRange[0] and byteRange[1].
+            // NB: We don't currently have any need to request a range with a delimited end.
+            VERIFY_NOT_REACHED();
+        }
+    }
+
+    // 8. Fetch request, with processResponse set to the following steps given response response:
+    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {};
+
+    fetch_algorithms_input.process_response = [self = GC::Ref(*this), byte_range = move(byte_range), fetch_generation](auto response) mutable {
+        auto& fetch_data = self->m_remote_fetch_data;
+
+        // FIXME: If the response is CORS cross-origin, we must use its internal response to query any of its data. See:
+        //        https://github.com/whatwg/html/issues/9355
+        response = response->unsafe_response();
+
+        // 1. Let global be the media element's node document's relevant global object.
+        auto& global = self->document().realm().global_object();
+
+        if (auto content_length = response->header_list()->extract_length(); content_length.template has<u64>()) {
+            auto actual_length = fetch_data->offset + content_length.template get<u64>();
+            fetch_data->stream->set_expected_size(actual_length);
+        }
+
+        if (auto accept_ranges = response->header_list()->extract_header_list_values("Accept-Ranges"sv); accept_ranges.template has<Vector<ByteString>>())
+            fetch_data->accepts_byte_ranges = accept_ranges.template get<Vector<ByteString>>().contains([](auto const& units) { return units == "bytes"sv; });
+
+        // 4. If the result of verifying response given the current media resource and byteRange is false, then abort these steps.
+        // NOTE: We do this step before creating the updateMedia task so that we can invoke the failure callback.
+        auto maybe_verify_response_failure = self->verify_response_or_get_failure_reason(response, byte_range);
+        if (maybe_verify_response_failure.has_value()) {
+            fetch_data->stream->close();
+            fetch_data->failure_callback(maybe_verify_response_failure.value());
+            return;
+        }
+
+        // 2. Let updateMedia be to queue a media element task given the media element to run the first appropriate steps from the media data processing
+        //    steps list below. (A new task is used for this so that the work described below occurs relative to the appropriate media element event task
+        //    source rather than using the networking task source.)
+        auto update_media = GC::create_function(self->heap(), [weak_self = GC::Weak(self), fetch_generation](ByteBuffer media_data) mutable {
+            if (!weak_self)
+                return;
+            if (fetch_generation != weak_self->m_current_fetch_generation)
+                return;
+            auto& fetch_data = weak_self->m_remote_fetch_data;
+
+            // 6. Update the media data with the contents of response's unsafe response obtained in this fashion. response can be CORS-same-origin or
+            //    CORS-cross-origin; this affects whether subtitles referenced in the media data are exposed in the API and, for video elements, whether
+            //    a canvas gets tainted when the video is drawn on it.
+            fetch_data->stream->add_chunk_at(fetch_data->offset, media_data.bytes());
+            fetch_data->offset += media_data.size();
+
+            weak_self->queue_a_media_element_task([](HTMLMediaElement& self) {
+                self.process_media_data(FetchingStatus::Ongoing);
+            });
+        });
+
+        // 3. Let processEndOfMedia be the following step: If the fetching process has completes without errors, including decoding the media data,
+        //    and if all of the data is available to the user agent without network access, then, the user agent must move on to the final step below.
+        //    This might never happen, e.g. when streaming an infinite resource such as web radio, or if the resource is longer than the user agent's
+        //    ability to cache data.
+        auto process_end_of_media = GC::create_function(self->heap(), [weak_self = GC::Weak(self), fetch_generation] {
+            if (!weak_self)
+                return;
+            if (fetch_generation != weak_self->m_current_fetch_generation)
+                return;
+
+            weak_self->m_remote_fetch_data->stream->close();
+            weak_self->queue_a_media_element_task([](HTMLMediaElement& self) {
+                self.process_media_data(FetchingStatus::Complete);
+            });
+        });
+
+        // 5. Otherwise, incrementally read response's body given updateMedia, processEndOfMedia, an empty algorithm, and global.
+
+        // AD-HOC: We need to pass a non-empty error algorithm in order to invoke the requisite steps.
+        auto process_body_error = GC::create_function(self->heap(), [weak_self = GC::Weak(self), fetch_generation](JS::Value) {
+            if (!weak_self)
+                return;
+            if (fetch_generation != weak_self->m_current_fetch_generation)
+                return;
+
+            weak_self->m_remote_fetch_data->stream->close();
+            weak_self->queue_a_media_element_task([](HTMLMediaElement& self) {
+                self.process_media_data(FetchingStatus::Interrupted);
+            });
+        });
+
+        VERIFY(response->body());
+        response->body()->incrementally_read(update_media, process_end_of_media, process_body_error, GC::Ref { global });
+    };
+
+    m_remote_fetch_data->fetch_controller = Fetch::Fetching::fetch(realm, request, Fetch::Infrastructure::FetchAlgorithms::create(vm, move(fetch_algorithms_input)));
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#concept-media-load-resource
@@ -1521,6 +1613,29 @@ Optional<String> HTMLMediaElement::verify_response_or_get_failure_reason(GC::Ref
     return {};
 }
 
+bool HTMLMediaElement::should_hold_screen_wake_lock() const
+{
+    if (!is<HTMLVideoElement>(*this))
+        return false;
+    if (m_video_tracks->selected_index() < 0)
+        return false;
+    if (!m_audio_tracks->has_enabled_track())
+        return false;
+
+    return potentially_playing();
+}
+
+void HTMLMediaElement::update_screen_wake_lock()
+{
+    if (should_hold_screen_wake_lock()) {
+        if (!m_screen_wake_lock.has_value())
+            m_screen_wake_lock.emplace(document().page());
+        return;
+    }
+
+    m_screen_wake_lock.clear();
+}
+
 void HTMLMediaElement::restart_fetch_at_offset(u64 offset)
 {
     VERIFY(m_remote_fetch_data);
@@ -1550,6 +1665,8 @@ void HTMLMediaElement::set_audio_track_enabled(Badge<AudioTrack>, GC::Ptr<HTML::
         m_playback_manager->enable_an_audio_track(audio_track->track_in_playback_manager());
     else
         m_playback_manager->disable_an_audio_track(audio_track->track_in_playback_manager());
+
+    update_screen_wake_lock();
 }
 
 Painting::VideoFrameResourceId HTMLMediaElement::ensure_video_frame_resource_id()
@@ -1612,6 +1729,8 @@ void HTMLMediaElement::set_selected_video_track(Badge<VideoTrack>, GC::Ptr<HTML:
 
     if (previous_track)
         m_playback_manager->remove_the_displaying_video_sink_for_track(previous_track->track_in_playback_manager());
+
+    update_screen_wake_lock();
 }
 
 void HTMLMediaElement::update_video_frame_and_timeline()
@@ -2052,6 +2171,7 @@ void HTMLMediaElement::forget_media_resource_specific_tracks()
     m_video_tracks->remove_all_tracks();
     m_playback_manager.clear();
     clear_compositor_video_frame();
+    update_screen_wake_lock();
 
     // NB: At this point, we no longer have any selected tracks to derive the video dimensions from.
     update_intrinsic_video_dimensions();
@@ -2068,6 +2188,7 @@ void HTMLMediaElement::set_ready_state(ReadyState ready_state)
 
     ScopeGuard guard { [&] {
         upon_has_ended_playback_possibly_changed();
+        update_screen_wake_lock();
         update_natural_dimensions();
         set_needs_style_update(true);
     } };
@@ -2294,6 +2415,12 @@ void HTMLMediaElement::play_element()
     //    selection algorithm.
     if (m_network_state == NetworkState::Empty)
         select_resource();
+
+    if (m_waiting_for_an_implementation_defined_event_to_fetch_the_resource) {
+        // NB: This is an implementation-defined event. See the NB in
+        //     wait_for_an_implementation_defined_event_before_fetching_the_resource().
+        continue_fetching_the_resource_after_an_implementation_defined_event();
+    }
 
     // 2. If the playback has ended and the direction of playback is forwards, seek to the earliest possible position
     //    of the media resource.
@@ -2557,6 +2684,8 @@ void HTMLMediaElement::notify_about_playing()
 
     if (m_audio_tracks->has_enabled_track())
         document().page().client().page_did_change_audio_play_state(AudioPlayState::Playing);
+
+    update_screen_wake_lock();
 }
 
 void HTMLMediaElement::set_show_poster(bool show_poster)
@@ -2585,6 +2714,8 @@ void HTMLMediaElement::set_paused(bool paused)
             document().page().client().page_did_change_audio_play_state(AudioPlayState::Paused);
     }
 
+    update_screen_wake_lock();
+
     update_natural_dimensions();
     set_needs_repaint();
     set_needs_style_update(true);
@@ -2592,7 +2723,12 @@ void HTMLMediaElement::set_paused(bool paused)
 
 void HTMLMediaElement::set_ended(bool ended)
 {
+    if (m_ended == ended)
+        return;
+
     m_ended = ended;
+
+    update_screen_wake_lock();
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#dom-media-defaultplaybackrate

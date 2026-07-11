@@ -47,6 +47,31 @@ Optional<WebView::ViewImplementation&> Application::active_web_view() const
     return {};
 }
 
+Vector<WebView::ViewImplementation&> Application::active_window_web_views() const
+{
+    Vector<WebView::ViewImplementation&> web_views;
+
+    auto add_window = [&](id window) {
+        if ([window isKindOfClass:[Tab class]])
+            web_views.append([[(Tab*)window web_view] view]);
+    };
+
+    auto* active_window = [NSApp keyWindow];
+    if (!active_window)
+        return {};
+
+    auto* tab_group = [active_window tabGroup];
+    if (!tab_group) {
+        add_window(active_window);
+        return web_views;
+    }
+
+    for (id window in [tab_group windows])
+        add_window(window);
+
+    return web_views;
+}
+
 Optional<WebView::ViewImplementation&> Application::open_blank_new_tab(Web::HTML::ActivateTab activate_tab) const
 {
     ApplicationDelegate* delegate = [NSApp delegate];
@@ -61,10 +86,47 @@ Optional<WebView::ViewImplementation&> Application::open_blank_new_tab(Web::HTML
     return [[tab web_view] view];
 }
 
-void Application::open_url_in_new_window(URL::URL const& url)
+void Application::open_url_in_new_tab(URL::URL const& url, Web::HTML::ActivateTab activate_tab) const
 {
     ApplicationDelegate* delegate = [NSApp delegate];
-    (void)[delegate createNewTab:url fromTab:nil activateTab:Web::HTML::ActivateTab::Yes];
+    auto* active_tab = [delegate activeTab];
+
+    auto is_private = active_tab ? [active_tab isPrivate] : WebView::IsPrivate::No;
+
+    (void)[delegate createNewTab:url
+                         fromTab:active_tab
+                       isPrivate:is_private
+                     activateTab:activate_tab
+                     tabLocation:TabLocation::after_tab(active_tab)];
+}
+
+void Application::open_urls_in_new_tabs(ReadonlySpan<URL::URL> urls) const
+{
+    ApplicationDelegate* delegate = [NSApp delegate];
+    auto* active_tab = [delegate activeTab];
+    auto* previous_tab = active_tab;
+
+    auto is_private = active_tab ? [active_tab isPrivate] : WebView::IsPrivate::No;
+
+    for (auto const& url : urls) {
+        auto location = previous_tab ? TabLocation::after_tab(previous_tab) : TabLocation::end();
+        auto* controller = [delegate createNewTab:url
+                                          fromTab:active_tab
+                                        isPrivate:is_private
+                                      activateTab:Web::HTML::ActivateTab::No
+                                      tabLocation:location];
+        previous_tab = (Tab*)[controller window];
+    }
+}
+
+void Application::open_url_in_new_window(URL::URL const& url, WebView::IsPrivate is_private)
+{
+    ApplicationDelegate* delegate = [NSApp delegate];
+    (void)[delegate createNewTab:url
+                         fromTab:nil
+                       isPrivate:is_private
+                     activateTab:Web::HTML::ActivateTab::Yes
+                     tabLocation:TabLocation::end()];
 }
 
 Optional<ByteString> Application::ask_user_for_download_path(ByteString const& file) const
@@ -109,6 +171,33 @@ void Application::display_error_dialog(StringView error_message) const
 
     [dialog beginSheetModalForWindow:[delegate activeTab]
                    completionHandler:nil];
+}
+
+void Application::open_download(WebView::FileDownloader::Download const& download) const
+{
+    auto path = download_file_path_for_frontend_action(download);
+    if (path.is_error()) {
+        display_error_dialog("Unable to open downloaded file: path cannot be represented by this frontend"sv);
+        return;
+    }
+
+    auto* ns_path = Ladybird::string_to_ns_string(path.release_value());
+    auto* url = [NSURL fileURLWithPath:ns_path];
+    if (![[NSWorkspace sharedWorkspace] openURL:url])
+        display_error_dialog("Unable to open downloaded file"sv);
+}
+
+void Application::show_download_in_folder(WebView::FileDownloader::Download const& download) const
+{
+    auto path = download_file_path_for_frontend_action(download);
+    if (path.is_error()) {
+        display_error_dialog("Unable to show downloaded file: path cannot be represented by this frontend"sv);
+        return;
+    }
+
+    auto* ns_path = Ladybird::string_to_ns_string(path.release_value());
+    if (![[NSWorkspace sharedWorkspace] selectFile:ns_path inFileViewerRootedAtPath:@""])
+        display_error_dialog("Unable to show downloaded file in folder"sv);
 }
 
 Utf16String Application::clipboard_text(ClipboardType) const

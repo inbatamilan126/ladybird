@@ -433,7 +433,7 @@ ErrorOr<Web::HTML::SessionHistoryDocumentStateDescriptor> IPC::decode(Decoder& d
     auto resource = TRY(decoder.decode<Variant<Empty, String, Web::HTML::POSTResource>>());
     auto reload_pending = TRY(decoder.decode<bool>());
     auto ever_populated = TRY(decoder.decode<bool>());
-    auto navigable_target_name = TRY(decoder.decode<String>());
+    auto navigable_target_name = TRY(decoder.decode<Utf16String>());
     auto nested_histories = TRY(decoder.decode<Vector<Web::HTML::SessionHistoryNestedHistoryDescriptor>>());
 
     return Web::HTML::SessionHistoryDocumentStateDescriptor {
@@ -463,8 +463,8 @@ ErrorOr<void> IPC::encode(Encoder& encoder, Web::HTML::SessionHistoryNestedHisto
 template<>
 ErrorOr<Web::HTML::SessionHistoryNestedHistoryDescriptor> IPC::decode(Decoder& decoder)
 {
-    auto id = TRY(decoder.decode<String>());
+    auto id = TRY(decoder.decode<Web::HTML::NavigableId>());
     auto entries = TRY(decoder.decode<Vector<Web::HTML::SessionHistoryEntryDescriptor>>());
 
-    return Web::HTML::SessionHistoryNestedHistoryDescriptor { move(id), move(entries) };
+    return Web::HTML::SessionHistoryNestedHistoryDescriptor { id, move(entries) };
 }

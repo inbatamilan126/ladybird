@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/Function.h>
+#include <AK/Platform.h>
 #include <LibURL/URL.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/PrivateBrowsing.h>
@@ -39,6 +40,7 @@ public:
     WindowConfiguration configuration_for_new_window() const;
     void open_new_tab();
     void open_new_window(WebView::IsPrivate);
+    void restart_private_browsing_session();
     void focus_location_editor();
     void reopen_recently_closed_tab();
     void open_file();
@@ -60,12 +62,18 @@ private:
 
     virtual void create_platform_options(WebView::BrowserOptions&, WebView::RequestServerOptions&, WebView::WebContentOptions&) override;
     virtual Core::EventLoop& create_platform_event_loop() override;
+#if !defined(AK_OS_MACOS)
+    virtual Optional<String> system_font_family() const override;
+#endif
 
     virtual Optional<WebView::ViewImplementation&> active_web_view() const override;
+    virtual Vector<WebView::ViewImplementation&> active_window_web_views() const override;
+    virtual bool activate_tab_with_url(URL::URL const&) const override;
+
     virtual Optional<WebView::ViewImplementation&> open_blank_new_tab(Web::HTML::ActivateTab) const override;
     virtual void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab) const override;
-    virtual bool activate_tab_with_url(URL::URL const&) const override;
-    virtual void open_url_in_new_window(URL::URL const& url) override;
+    virtual void open_urls_in_new_tabs(ReadonlySpan<URL::URL>) const override;
+    virtual void open_url_in_new_window(URL::URL const&, WebView::IsPrivate) override;
 
     virtual Optional<ByteString> ask_user_for_download_path(ByteString const& file) const override;
     virtual void display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const override;
@@ -81,8 +89,16 @@ private:
     virtual void insert_clipboard_entry(Web::Clipboard::SystemClipboardRepresentation) override;
 
     virtual bool supports_vertical_tabs() const override { return true; }
-    virtual bool supports_server_side_window_decorations() const override { return true; }
-    virtual Vector<WebView::BookmarkItem::Bookmark> bookmarks_for_all_tabs() const override;
+    virtual bool supports_private_browsing_windows() const override { return true; }
+    virtual bool supports_client_side_window_decorations() const override
+    {
+#if defined(AK_OS_MACOS)
+        return false;
+#else
+        return true;
+#endif
+    }
+
     virtual void update_tabs_display() const override;
 
     virtual void rebuild_bookmarks_menu() const override;
@@ -92,7 +108,6 @@ private:
     virtual NonnullRefPtr<BookmarkPromise> display_edit_bookmark_dialog(WebView::BookmarkItem::Bookmark const& current_bookmark) const override;
     virtual NonnullRefPtr<BookmarkFolderPromise> display_add_bookmark_folder_dialog(Optional<String const&> default_title = {}) const override;
     virtual NonnullRefPtr<BookmarkFolderPromise> display_edit_bookmark_folder_dialog(WebView::BookmarkItem::Folder const& current_folder) const override;
-    virtual String suggested_bookmark_all_tabs_folder_title() const override;
 
     virtual void on_devtools_enabled() const override;
     virtual void on_devtools_disabled() const override;

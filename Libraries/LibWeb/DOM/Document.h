@@ -19,6 +19,8 @@
 #include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
 #include <AK/String.h>
+#include <AK/Utf16FlyString.h>
+#include <AK/Utf16String.h>
 #include <AK/Vector.h>
 #include <AK/WeakPtr.h>
 #include <LibCore/Forward.h>
@@ -43,6 +45,7 @@
 #include <LibWeb/HTML/DocumentReadyState.h>
 #include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/PaintConfig.h>
+#include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/PreloadEntry.h>
 #include <LibWeb/HTML/SandboxingFlagSet.h>
 #include <LibWeb/HTML/Scripting/ScriptRegistry.h>
@@ -90,6 +93,7 @@ enum class InvalidateLayoutTreeReason {
 #define ENUMERATE_UPDATE_LAYOUT_REASONS(X)   \
     X(AutoScrollSelection)                   \
     X(ChildDocumentStyleUpdate)              \
+    X(CursorLineNavigation)                  \
     X(Debugging)                             \
     X(DocumentElementFromPoint)              \
     X(DocumentElementsFromPoint)             \
@@ -235,6 +239,7 @@ public:
     //         dom_tree_version() to understand whether either the DOM tree structure or contents were changed.
     u64 character_data_version() const { return m_character_data_version; }
     void bump_character_data_version() { ++m_character_data_version; }
+    bool preserve_selection_offsets_during_identical_character_data_replacement() const { return m_preserve_selection_offsets_during_identical_character_data_replacement; }
 
     WebIDL::ExceptionOr<void> populate_with_html_head_and_body();
 
@@ -247,20 +252,20 @@ public:
     void set_cookie_version_index(Core::SharedVersionIndex cookie_version_index) { m_cookie_version_index = cookie_version_index; }
     void reset_cookie_version() { m_cookie_version = Core::INVALID_SHARED_VERSION; }
 
-    String fg_color() const;
-    void set_fg_color(String const&);
+    Utf16String fg_color() const;
+    void set_fg_color(Utf16String const&);
 
-    String link_color() const;
-    void set_link_color(String const&);
+    Utf16String link_color() const;
+    void set_link_color(Utf16String const&);
 
-    String vlink_color() const;
-    void set_vlink_color(String const&);
+    Utf16String vlink_color() const;
+    void set_vlink_color(Utf16String const&);
 
-    String alink_color() const;
-    void set_alink_color(String const&);
+    Utf16String alink_color() const;
+    void set_alink_color(Utf16String const&);
 
-    String bg_color() const;
-    void set_bg_color(String const&);
+    Utf16String bg_color() const;
+    void set_bg_color(Utf16String const&);
 
     String referrer() const;
     void set_referrer(String);
@@ -285,7 +290,9 @@ public:
     void set_opener_policy(HTML::OpenerPolicy policy) { m_opener_policy = move(policy); }
 
     Optional<URL::URL> encoding_parse_url(StringView) const;
+    Optional<URL::URL> encoding_parse_url(Utf16View) const;
     Optional<String> encoding_parse_and_serialize_url(StringView) const;
+    Optional<String> encoding_parse_and_serialize_url(Utf16String const&) const;
 
     CSS::StyleComputer& style_computer() { return *m_style_computer; }
     CSS::StyleComputer const& style_computer() const { return *m_style_computer; }
@@ -304,7 +311,7 @@ public:
 
     Optional<String> get_style_sheet_source(CSS::StyleSheetIdentifier const&) const;
 
-    virtual FlyString node_name() const override { return "#document"_fly_string; }
+    virtual Utf16FlyString node_name() const override { return "#document"_utf16_fly_string; }
 
     void set_hovered_node(GC::Ptr<Node>, Optional<HoverEventData> = {});
     Node* hovered_node() { return m_hovered_node.ptr(); }
@@ -332,8 +339,8 @@ public:
     HTML::HTMLHeadElement* head();
     GC::Ptr<HTML::HTMLTitleElement> title_element();
 
-    StringView dir() const;
-    void set_dir(String const&);
+    Utf16String dir() const;
+    void set_dir(Utf16String const&);
 
     HTML::HTMLElement* body();
 
@@ -385,15 +392,17 @@ public:
     Optional<Color> visited_link_color() const;
     void set_visited_link_color(Color);
 
-    Optional<Vector<String> const&> supported_color_schemes() const;
-    void set_supported_color_schemes(Vector<String>);
-    void set_supported_color_schemes(Optional<Vector<String>>);
+    Optional<Vector<Utf16FlyString> const&> supported_color_schemes() const;
+    void set_supported_color_schemes(Vector<Utf16FlyString>);
+    void set_supported_color_schemes(Optional<Vector<Utf16FlyString>>);
     void obtain_supported_color_schemes();
 
     void obtain_theme_color();
 
     void update_style();
     void invalidate_style_for_viewport_change();
+    bool suppresses_attribute_style_invalidation() const { return m_suppresses_attribute_style_invalidation; }
+    void set_suppresses_attribute_style_invalidation(bool suppresses) { m_suppresses_attribute_style_invalidation = suppresses; }
     void update_style_if_needed_for_element(AbstractElement const&);
     using StyleUpdateMode = CSS::StyleUpdateMode;
     CSS::ComputedProperties const* update_style_for_element(AbstractElement const&);
@@ -426,7 +435,7 @@ public:
     RefPtr<Painting::ViewportPaintable const> unsafe_paintable() const;
     RefPtr<Painting::ViewportPaintable> unsafe_paintable();
 
-    GC::Ref<NodeList> get_elements_by_name(FlyString const&);
+    GC::Ref<NodeList> get_elements_by_name(Utf16String const&);
 
     GC::Ref<HTMLCollection> applets();
     GC::Ref<HTMLCollection> anchors();
@@ -450,16 +459,16 @@ public:
 
     HTML::EnvironmentSettingsObject& relevant_settings_object() const;
 
-    WebIDL::ExceptionOr<GC::Ref<Element>> create_element(String const& local_name, Variant<String, Bindings::ElementCreationOptions> const& options);
-    WebIDL::ExceptionOr<GC::Ref<Element>> create_element_ns(Optional<FlyString> const& namespace_, String const& qualified_name, Variant<String, Bindings::ElementCreationOptions> const& options);
+    WebIDL::ExceptionOr<GC::Ref<Element>> create_element(Utf16FlyString local_name, Variant<Utf16FlyString, Bindings::ElementCreationOptions> const& options);
+    WebIDL::ExceptionOr<GC::Ref<Element>> create_element_ns(Optional<Utf16FlyString> namespace_, Utf16FlyString const& qualified_name, Variant<Utf16FlyString, Bindings::ElementCreationOptions> const& options);
     GC::Ref<DocumentFragment> create_document_fragment();
     GC::Ref<Text> create_text_node(Utf16String data);
     WebIDL::ExceptionOr<GC::Ref<CDATASection>> create_cdata_section(Utf16String data);
     GC::Ref<Comment> create_comment(Utf16String data);
-    WebIDL::ExceptionOr<GC::Ref<ProcessingInstruction>> create_processing_instruction(String const& target, Utf16String data);
+    WebIDL::ExceptionOr<GC::Ref<ProcessingInstruction>> create_processing_instruction(Utf16FlyString const& target, Utf16String data);
 
-    WebIDL::ExceptionOr<GC::Ref<Attr>> create_attribute(String const& local_name);
-    WebIDL::ExceptionOr<GC::Ref<Attr>> create_attribute_ns(Optional<FlyString> const& namespace_, String const& qualified_name);
+    WebIDL::ExceptionOr<GC::Ref<Attr>> create_attribute(Utf16FlyString const& local_name);
+    WebIDL::ExceptionOr<GC::Ref<Attr>> create_attribute_ns(Optional<Utf16FlyString> namespace_, Utf16FlyString const& qualified_name);
 
     WebIDL::ExceptionOr<GC::Ref<Event>> create_event(StringView interface);
     GC::Ref<Range> create_range();
@@ -566,8 +575,8 @@ public:
     String const& content_type() const { return m_content_type; }
     void set_content_type(String content_type) { m_content_type = move(content_type); }
 
-    Optional<String> const& pragma_set_default_language() const { return m_pragma_set_default_language; }
-    void set_pragma_set_default_language(String language) { m_pragma_set_default_language = move(language); }
+    Optional<Utf16String> const& pragma_set_default_language() const { return m_pragma_set_default_language; }
+    void set_pragma_set_default_language(Utf16String language) { m_pragma_set_default_language = move(language); }
     Optional<String> const& http_content_language() const { return m_http_content_language; }
 
     bool has_encoding() const { return m_encoding.has_value(); }
@@ -604,8 +613,8 @@ public:
     bool is_fully_active() const;
     bool is_active() const;
 
-    [[nodiscard]] bool allow_declarative_shadow_roots() const;
-    void set_allow_declarative_shadow_roots(bool);
+    [[nodiscard]] HTML::HTMLParser::AllowDeclarativeShadowRoots allow_declarative_shadow_roots() const;
+    void set_allow_declarative_shadow_roots(HTML::HTMLParser::AllowDeclarativeShadowRoots allow_declarative_shadow_roots);
 
     GC::Ref<HTML::History> history();
     GC::Ref<HTML::History> history() const;
@@ -664,7 +673,7 @@ public:
     void set_temporary_document_for_fragment_parsing(Badge<HTML::HTMLParser>);
     [[nodiscard]] bool is_temporary_document_for_fragment_parsing() const { return m_temporary_document_for_fragment_parsing; }
 
-    static bool is_valid_name(String const&);
+    static bool is_valid_name(Utf16View const&);
 
     GC::Ref<NodeIterator> create_node_iterator(Node& root, unsigned what_to_show, GC::Ptr<NodeFilter>);
     GC::Ref<TreeWalker> create_tree_walker(Node& root, unsigned what_to_show, GC::Ptr<NodeFilter>);
@@ -689,6 +698,7 @@ public:
     bool needs_full_style_update() const { return m_needs_full_style_update; }
     void set_needs_full_style_update(bool b) { m_needs_full_style_update = b; }
     void build_registered_properties_cache_for_style_update() { build_registered_properties_cache(); }
+    void set_needs_registered_properties_cache_update() { m_needs_registered_properties_cache_update = true; }
     void set_needs_container_query_evaluation_after_layout(Element const& query_container);
 
     [[nodiscard]] bool needs_full_layout_tree_update() const { return m_needs_full_layout_tree_update; }
@@ -772,12 +782,17 @@ public:
     void set_previous_document_unload_timing(DocumentUnloadTimingInfo const& previous_document_unload_timing) { m_previous_document_unload_timing = previous_document_unload_timing; }
 
     // https://w3c.github.io/editing/docs/execCommand/
+    enum class DispatchInputEvent {
+        No,
+        Yes,
+    };
     WebIDL::ExceptionOr<bool> exec_command(FlyString const& command, bool show_ui, Utf16String const& value);
+    WebIDL::ExceptionOr<bool> exec_command_internal(FlyString const& command, bool show_ui, Utf16String const& value, DispatchInputEvent);
     WebIDL::ExceptionOr<bool> query_command_enabled(FlyString const& command);
     WebIDL::ExceptionOr<bool> query_command_indeterm(FlyString const& command);
     WebIDL::ExceptionOr<bool> query_command_state(FlyString const& command);
     WebIDL::ExceptionOr<bool> query_command_supported(FlyString const& command);
-    WebIDL::ExceptionOr<String> query_command_value(FlyString const& command);
+    WebIDL::ExceptionOr<Utf16String> query_command_value(FlyString const& command);
 
     WebIDL::ExceptionOr<GC::Ref<XPath::XPathExpression>> create_expression(String const& expression, GC::Ptr<XPath::XPathNSResolver> resolver = nullptr);
     WebIDL::ExceptionOr<GC::Ref<XPath::XPathResult>> evaluate(String const& expression, DOM::Node const& context_node, GC::Ptr<XPath::XPathNSResolver> resolver = nullptr, WebIDL::UnsignedShort type = 0, GC::Ptr<XPath::XPathResult> result = nullptr);
@@ -824,7 +839,7 @@ public:
     void start_intersection_observing_a_lazy_loading_element(Element&);
     void stop_intersection_observing_a_lazy_loading_element(Element&);
 
-    void shared_declarative_refresh_steps(StringView input, GC::Ptr<HTML::HTMLMetaElement const> meta_element = nullptr);
+    void shared_declarative_refresh_steps(Utf16View input, GC::Ptr<HTML::HTMLMetaElement const> meta_element = nullptr);
 
     struct TopOfTheDocument { };
     using IndicatedPart = Variant<Element*, TopOfTheDocument>;
@@ -876,7 +891,7 @@ public:
     RefPtr<HTML::SessionHistoryEntry> latest_entry() const { return m_latest_entry; }
     void set_latest_entry(RefPtr<HTML::SessionHistoryEntry>);
 
-    void element_id_changed(Badge<DOM::Element>, GC::Ref<DOM::Element> element, Optional<FlyString> old_id);
+    void element_id_changed(Badge<DOM::Element>, GC::Ref<DOM::Element> element, Optional<Utf16FlyString> old_id);
     void element_with_id_was_added(Badge<DOM::Element>, GC::Ref<DOM::Element> element);
     void element_with_id_was_removed(Badge<DOM::Element>, GC::Ref<DOM::Element> element);
     void element_name_changed(Badge<DOM::Element>, GC::Ref<DOM::Element> element);
@@ -885,7 +900,7 @@ public:
 
     // https://drafts.csswg.org/css-anchor-position-1/#determining
     AnchorNameMap& anchor_name_map() { return m_anchor_name_map; }
-    GC::Ptr<Element> element_by_anchor_name(FlyString const& name, Node const& querying_node) const;
+    GC::Ptr<Element> element_by_anchor_name(Utf16FlyString const& name, Node const& querying_node) const;
 
     void add_form_associated_element_with_form_attribute(HTML::FormAssociatedElement&);
     void remove_form_associated_element_with_form_attribute(HTML::FormAssociatedElement&);
@@ -930,6 +945,7 @@ public:
         u64 previous_sibling_invalidation_walk_visits { 0 };
         u64 descendant_slot_invalidation_subtree_scans { 0 };
         u64 media_rule_evaluations { 0 };
+        u64 registered_properties_cache_rebuilds { 0 };
     };
     StyleInvalidationCounters& style_invalidation_counters() const { return m_style_invalidation_counters; }
     void reset_style_invalidation_counters() const;
@@ -942,8 +958,8 @@ public:
     void schedule_accumulated_visual_context_value_update(Element&);
     void schedule_accumulated_visual_context_value_update(Layout::Node const&);
 
-    virtual JS::Value named_item_value(FlyString const& name) const override;
-    virtual Vector<FlyString> supported_property_names() const override;
+    virtual JS::Value named_item_value(Utf16FlyString const& name) const override;
+    virtual Vector<Utf16FlyString> supported_property_names() const override;
     Vector<GC::Ref<DOM::Element>> const& potentially_named_elements() const { return m_potentially_named_elements; }
 
     void gather_active_observations_at_depth(size_t depth);
@@ -1002,7 +1018,7 @@ public:
 
     Vector<GC::Root<Range>> find_matching_text(String const&, CaseSensitivity);
 
-    void parse_html_from_a_string(StringView);
+    void parse_html_from_a_string(Utf16View);
     static WebIDL::ExceptionOr<GC::Root<DOM::Document>> parse_html_unsafe(JS::VM&, TrustedTypes::TrustedHTMLOrString const&);
 
     void set_console_client(GC::Ptr<JS::ConsoleClient> console_client) { m_console_client = console_client; }
@@ -1031,7 +1047,7 @@ public:
     Optional<Painting::HitTestResult> hit_test(CSSPixelPoint, Painting::HitTestType);
     Optional<Painting::CaretPosition> caret_position_from_point(CSSPixelPoint);
     Optional<Painting::CaretPosition> caret_position_from_point_for_selection_start(CSSPixelPoint);
-    Optional<Painting::CaretPosition> caret_position_from_point_for_selection(CSSPixelPoint);
+    Optional<Painting::CaretPosition> caret_position_from_point_for_selection(CSSPixelPoint, Node const* constraint_scope = nullptr);
     GC::Ptr<CaretPosition> caret_position_from_point(double x, double y, Bindings::CaretPositionFromPointOptions const&);
     TraversalDecision hit_test_all(CSSPixelPoint, Function<TraversalDecision(Painting::HitTestResult)> const&);
 
@@ -1083,8 +1099,8 @@ public:
     GC::Ref<EditingHostManager> editing_host_manager() const { return *m_editing_host_manager; }
 
     // https://w3c.github.io/editing/docs/execCommand/#default-single-line-container-name
-    FlyString const& default_single_line_container_name() const { return m_default_single_line_container_name; }
-    void set_default_single_line_container_name(FlyString const& name) { m_default_single_line_container_name = name; }
+    Utf16FlyString const& default_single_line_container_name() const { return m_default_single_line_container_name; }
+    void set_default_single_line_container_name(Utf16FlyString const& name) { m_default_single_line_container_name = name; }
 
     // https://w3c.github.io/editing/docs/execCommand/#css-styling-flag
     bool css_styling_flag() const { return m_css_styling_flag; }
@@ -1163,7 +1179,7 @@ public:
     CSS::StyleScope& style_scope() { return m_style_scope; }
     String const& content_blocker_style_sheet();
     void invalidate_content_blocker_style_sheet();
-    bool content_blocker_style_sheet_may_need_refresh_for_class_or_id(FlyString const* id, ReadonlySpan<FlyString> class_names);
+    bool content_blocker_style_sheet_may_need_refresh_for_class_or_id(Utf16FlyString const* id, ReadonlySpan<Utf16FlyString> class_names);
 
     void exit_pointer_lock();
 
@@ -1174,7 +1190,7 @@ public:
     void set_custom_element_registry(GC::Ptr<HTML::CustomElementRegistry> custom_element_registry) { m_custom_element_registry = custom_element_registry; }
     GC::Ptr<HTML::CustomElementRegistry> effective_global_custom_element_registry() const;
 
-    void upgrade_particular_elements(GC::Ref<HTML::CustomElementRegistry>, GC::Ref<HTML::CustomElementDefinition>, String local_name, Optional<String> name = {});
+    void upgrade_particular_elements(GC::Ref<HTML::CustomElementRegistry>, GC::Ref<HTML::CustomElementDefinition>, Utf16FlyString local_name, Optional<Utf16FlyString> name = {});
 
     Vector<URL::Origin> internal_ancestor_origin_objects_list_creation_steps(ReferrerPolicy::ReferrerPolicy) const;
     Optional<Vector<URL::Origin>>& internal_ancestor_origin_objects_list() { return m_internal_ancestor_origin_objects_list; }
@@ -1221,7 +1237,7 @@ private:
     void queue_intersection_observer_task();
     void queue_an_intersection_observer_entry(IntersectionObserver::IntersectionObserver&, HighResolutionTime::DOMHighResTimeStamp time, GC::Ref<Geometry::DOMRectReadOnly> root_bounds, GC::Ref<Geometry::DOMRectReadOnly> bounding_client_rect, GC::Ref<Geometry::DOMRectReadOnly> intersection_rect, bool is_intersecting, double intersection_ratio, GC::Ref<Element> target);
 
-    Element* find_a_potential_indicated_element(FlyString const& fragment) const;
+    Element* find_a_potential_indicated_element(Utf16String const& fragment) const;
 
     void dispatch_events_for_transition(GC::Ref<CSS::CSSTransition>);
 
@@ -1249,9 +1265,9 @@ private:
 
     struct RegistryAndIs {
         GC::Ptr<HTML::CustomElementRegistry> registry;
-        Optional<String> is;
+        Optional<Utf16FlyString> is;
     };
-    WebIDL::ExceptionOr<RegistryAndIs> flatten_element_creation_options(Variant<String, Bindings::ElementCreationOptions> const&) const;
+    WebIDL::ExceptionOr<RegistryAndIs> flatten_element_creation_options(Variant<Utf16FlyString, Bindings::ElementCreationOptions> const&) const;
 
     GC::Ref<Page> m_page;
     GC::Ptr<CSS::StyleComputer> m_style_computer;
@@ -1288,7 +1304,7 @@ private:
     Optional<Color> m_active_link_color;
     Optional<Color> m_visited_link_color;
 
-    Optional<Vector<String>> m_supported_color_schemes;
+    Optional<Vector<Utf16FlyString>> m_supported_color_schemes;
 
     GC::Ptr<HTML::HTMLParser> m_parser;
     bool m_active_parser_was_aborted { false };
@@ -1344,7 +1360,7 @@ private:
     //            browsing context.
     HTML::DocumentReadyState m_readiness { HTML::DocumentReadyState::Complete };
     String m_content_type { "application/xml"_string };
-    Optional<String> m_pragma_set_default_language;
+    Optional<Utf16String> m_pragma_set_default_language;
     Optional<String> m_http_content_language;
     Optional<String> m_encoding;
 
@@ -1399,6 +1415,7 @@ private:
     Vector<GC::Weak<CSS::MediaQueryList>> m_media_query_lists;
 
     bool m_needs_full_style_update { false };
+    bool m_suppresses_attribute_style_invalidation { false };
     HashTable<GC::Ref<Element>> m_query_containers_needing_container_query_evaluation_after_layout;
     bool m_needs_full_layout_tree_update { false };
 
@@ -1565,8 +1582,8 @@ private:
 
     Optional<String> m_content_blocker_style_sheet;
     // Class/id tokens already covered by the cached content blocker stylesheet.
-    HashTable<FlyString> m_content_blocker_style_sheet_checked_classes;
-    HashTable<FlyString> m_content_blocker_style_sheet_checked_ids;
+    HashTable<Utf16FlyString> m_content_blocker_style_sheet_checked_classes;
+    HashTable<Utf16FlyString> m_content_blocker_style_sheet_checked_ids;
 
     Optional<AK::UnixDateTime> m_last_modified;
 
@@ -1589,7 +1606,7 @@ private:
     GC::Ptr<HTML::HTMLDialogElement> m_dialog_pointerdown_target;
 
     // https://dom.spec.whatwg.org/#document-allow-declarative-shadow-roots
-    bool m_allow_declarative_shadow_roots { false };
+    HTML::HTMLParser::AllowDeclarativeShadowRoots m_allow_declarative_shadow_roots { HTML::HTMLParser::AllowDeclarativeShadowRoots::No };
 
     // https://w3c.github.io/selection-api/#dfn-has-scheduled-selectionchange-event
     bool m_has_scheduled_selectionchange_event { false };
@@ -1613,9 +1630,10 @@ private:
     GC::Ref<EditingHostManager> m_editing_host_manager;
 
     bool m_inside_exec_command { false };
+    bool m_preserve_selection_offsets_during_identical_character_data_replacement { false };
 
     // https://w3c.github.io/editing/docs/execCommand/#default-single-line-container-name
-    FlyString m_default_single_line_container_name { HTML::TagNames::div };
+    Utf16FlyString m_default_single_line_container_name { HTML::TagNames::div };
 
     // https://w3c.github.io/editing/docs/execCommand/#css-styling-flag
     bool m_css_styling_flag { false };
@@ -1657,6 +1675,7 @@ private:
     // https://www.w3.org/TR/css-properties-values-api-1/#dom-window-registeredpropertyset-slot
     HashMap<Utf16FlyString, CSS::CustomPropertyRegistration> m_registered_property_set;
     HashMap<Utf16FlyString, CSS::CustomPropertyRegistration> m_cached_registered_properties_from_css_property_rules;
+    bool m_needs_registered_properties_cache_update { true };
     size_t m_custom_property_registration_generation { 0 };
 
     CSS::StyleScope m_style_scope;

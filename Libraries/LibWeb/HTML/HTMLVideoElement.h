@@ -70,14 +70,16 @@ private:
     virtual void visit_edges(Cell::Visitor&) override;
     virtual void adopted_from(DOM::Document&) override;
 
-    virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
     // https://html.spec.whatwg.org/multipage/media.html#the-video-element:dimension-attributes
     virtual bool supports_dimension_attributes() const override { return true; }
 
+    virtual bool is_html_video_element() const override { return true; }
+
     virtual RefPtr<Layout::Node> create_layout_node(CSS::ComputedProperties const&) override;
 
-    WebIDL::ExceptionOr<void> determine_element_poster_frame(Optional<String> const& poster);
+    WebIDL::ExceptionOr<void> determine_element_poster_frame(Optional<Utf16String> const& poster);
 
     GC::Ptr<HTML::VideoTrack> m_video_track;
     VideoFrame m_current_frame;
@@ -89,5 +91,22 @@ private:
     GC::Ptr<Fetch::Infrastructure::FetchController> m_fetch_controller;
     Optional<DOM::DocumentLoadEventDelayer> m_load_event_delayer;
 };
+
+}
+
+namespace Web::DOM {
+
+template<>
+inline bool Node::fast_is<HTML::HTMLVideoElement>() const { return is_html_video_element(); }
+
+}
+
+namespace JS {
+
+template<>
+inline bool Object::fast_is<Web::HTML::HTMLVideoElement>() const
+{
+    return is_dom_node() && static_cast<Web::DOM::Node const&>(*this).is_html_video_element();
+}
 
 }

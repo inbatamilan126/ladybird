@@ -637,6 +637,7 @@ set(SOURCES
     HTML/MimeType.cpp
     HTML/MimeTypeArray.cpp
     HTML/Navigable.cpp
+    HTML/NavigableId.cpp
     HTML/NavigableContainer.cpp
     HTML/NavigateEvent.cpp
     HTML/Navigation.cpp
@@ -673,6 +674,7 @@ set(SOURCES
     HTML/PreloadEntry.cpp
     HTML/PromiseRejectionEvent.cpp
     HTML/RadioNodeList.cpp
+    HTML/ReplicatedNavigableState.cpp
     HTML/SandboxingFlagSet.cpp
     HTML/Scripting/Agent.cpp
     HTML/Scripting/ClassicScript.cpp
@@ -869,6 +871,7 @@ set(SOURCES
     Page/InputEvent.cpp
     Page/MiddleButtonScrollHandler.cpp
     Page/Page.cpp
+    Page/ScreenWakeLockHandle.cpp
     Painting/AccumulatedVisualContext.cpp
     Painting/BackgroundPainting.cpp
     Painting/Blending.cpp
@@ -877,6 +880,7 @@ set(SOURCES
     Painting/BorderRadiusCornerClipper.cpp
     Painting/BordersData.cpp
     Painting/BoxModelMetrics.cpp
+    Painting/Canvas2DCommandStream.cpp
     Painting/CanvasPaintable.cpp
     Painting/CheckBoxPaintable.cpp
     Painting/DisplayList.cpp
@@ -1096,6 +1100,7 @@ set(SOURCES
     UserTiming/PerformanceMark.cpp
     UserTiming/PerformanceMeasure.cpp
     ViewTransition/ViewTransition.cpp
+    VisualLines.cpp
     WebLocks/AbstractOperations.cpp
     WebLocks/Lock.cpp
     WebLocks/LockManager.cpp

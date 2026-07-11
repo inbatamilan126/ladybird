@@ -12,9 +12,11 @@
 #include <LibWeb/CSS/PreferredMotion.h>
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/CSS/StyleSheetIdentifier.h>
+#include <LibWeb/HTML/AudioPlayState.h>
 #include <LibWeb/HTML/AutoplayPolicy.h>
 #include <LibWeb/HTML/ColorPickerUpdateState.h>
 #include <LibWeb/HTML/BroadcastChannelMessage.h>
+#include <LibWeb/HTML/NavigableId.h>
 #include <LibWeb/HTML/SelectedFile.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWeb/HTML/VisibilityState.h>
@@ -26,6 +28,7 @@
 #include <LibWeb/WebDriver/ExecuteScript.h>
 #include <LibWeb/WebDriver/Response.h>
 #include <LibWebView/Attribute.h>
+#include <LibWebView/DictionaryLookup.h>
 #include <LibWebView/DOMNodeProperties.h>
 #include <LibWebView/PageInfo.h>
 #include <LibWebView/Settings.h>
@@ -34,7 +37,7 @@
 endpoint WebContentServer
 {
     init_transport(int peer_pid) => (int peer_pid)
-    initialize(u64 initial_page_id) =|
+    initialize(u64 initial_page_id, Web::HTML::NavigableId root_navigable_id, Web::HTML::NavigableIdAllocator navigable_id_allocator) =|
     close_server() =|
 
     get_window_handle(u64 page_id) => (String handle)
@@ -60,9 +63,9 @@ endpoint WebContentServer
     load_html_with_url(u64 page_id, ByteString html, URL::URL url) =|
     reload(u64 page_id) =|
     cancel_download(u64 page_id, u64 download_id) =|
-    run_iframe_load_event_steps(u64 page_id, String frame_id) =|
+    run_iframe_load_event_steps(u64 page_id, Web::HTML::NavigableId frame_id) =|
     set_page_parent_context(u64 page_id, Optional<Web::Compositor::CompositorContextId> parent_context_id) =|
-    set_remote_child_frame_compositor_context(u64 page_id, String frame_id, Optional<Web::Compositor::CompositorContextId> context_id) =|
+    set_remote_child_frame_compositor_context(u64 page_id, Web::HTML::NavigableId frame_id, Optional<Web::Compositor::CompositorContextId> context_id) =|
     traverse_the_history_to_step(u64 page_id, i32 step) =|
     check_if_traverse_history_step_is_canceled(u64 page_id, u64 request_id, i32 step) =|
     set_top_level_session_history(u64 page_id, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries,
@@ -118,9 +121,9 @@ endpoint WebContentServer
     get_dom_node_outer_html(u64 page_id, Web::UniqueNodeID node_id) =|
     set_dom_node_outer_html(u64 page_id, Web::UniqueNodeID node_id, String html) =|
     set_dom_node_text(u64 page_id, Web::UniqueNodeID node_id, String text) =|
-    set_dom_node_tag(u64 page_id, Web::UniqueNodeID node_id, String name) =|
+    set_dom_node_tag(u64 page_id, Web::UniqueNodeID node_id, Utf16FlyString name) =|
     add_dom_node_attributes(u64 page_id, Web::UniqueNodeID node_id, Vector<WebView::Attribute> attributes) =|
-    replace_dom_node_attribute(u64 page_id, Web::UniqueNodeID node_id, String name, Vector<WebView::Attribute> replacement_attributes) =|
+    replace_dom_node_attribute(u64 page_id, Web::UniqueNodeID node_id, Utf16FlyString name, Vector<WebView::Attribute> replacement_attributes) =|
     create_child_element(u64 page_id, Web::UniqueNodeID node_id) =|
     create_child_text_node(u64 page_id, Web::UniqueNodeID node_id) =|
     insert_dom_node_before(u64 page_id, Web::UniqueNodeID node_id, Web::UniqueNodeID parent_node_id, Optional<Web::UniqueNodeID> sibling_node_id) =|
@@ -133,6 +136,8 @@ endpoint WebContentServer
     request_internal_page_info(u64 page_id, WebView::PageInfoType type) =|
 
     get_selected_text(u64 page_id) => (ByteString selection)
+    get_selected_text_for_lookup(u64 page_id) => (Optional<WebView::DictionaryLookup> lookup)
+    select_word_for_dictionary_lookup(u64 page_id, Web::DevicePixelPoint position) => (bool selected)
     cut_selected_text(u64 page_id) => (ByteString selection)
     select_all(u64 page_id) =|
     paste(u64 page_id, Utf16String text) =|
@@ -183,11 +188,12 @@ endpoint WebContentServer
     toggle_media_fullscreen_state(u64 page_id) =|
     toggle_media_controls_state(u64 page_id) =|
 
-    toggle_page_mute_state(u64 page_id) =|
+    set_page_mute_state(u64 page_id, Web::HTML::MuteState mute_state) =|
 
     set_user_style(u64 page_id, String source) =|
 
     system_time_zone_changed() =|
+    set_system_font_family(String family) =|
 
     set_document_cookie_version_buffer(u64 page_id, Core::AnonymousBuffer document_cookie_version_buffer) =|
     set_document_cookie_version_index(u64 page_id, i64 document_id, Core::SharedVersionIndex document_index) =|

@@ -23,12 +23,12 @@
 #include <QAction>
 #include <QClipboard>
 #include <QComboBox>
-#include <QDate>
 #include <QDesktopServices>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFileDialog>
 #include <QFileOpenEvent>
+#include <QFont>
 #include <QFormLayout>
 #include <QKeySequence>
 #include <QLineEdit>
@@ -36,6 +36,7 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
+#include <QPointer>
 #include <QSizePolicy>
 #include <QStandardPaths>
 #include <QTimer>
@@ -117,6 +118,13 @@ public:
                 break;
 
             auto const& open_event = *static_cast<QFileOpenEvent const*>(event);
+            auto const qurl = open_event.url();
+            if (!qurl.isEmpty()) {
+                if (auto url = WebView::sanitize_url(ak_byte_string_from_qbytearray(qurl.toEncoded())); url.has_value())
+                    application.on_open_file(url.release_value());
+                break;
+            }
+
             auto file = ak_string_from_qstring(open_event.file());
 
             if (auto file_url = WebView::sanitize_url(file); file_url.has_value())
@@ -236,6 +244,19 @@ public:
         update_reopen_recently_closed_action();
         update_application_menu_bar_tab_menus();
     }
+
+    void create_dock_menu()
+    {
+        if (m_dock_menu)
+            return;
+
+        m_dock_menu = new QMenu(m_application_menu_bar);
+        QObject::connect(m_dock_menu, &QMenu::aboutToShow, this, [this] {
+            rebuild_dock_menu();
+        });
+        rebuild_dock_menu();
+        m_dock_menu->setAsDockMenu();
+    }
 #endif
 
 #if defined(AK_OS_MACOS)
@@ -264,6 +285,54 @@ public:
 
 private:
 #if defined(AK_OS_MACOS)
+    void rebuild_dock_menu()
+    {
+        m_dock_menu->clear();
+
+        auto* new_window_action = m_dock_menu->addAction("New Window");
+        QObject::connect(new_window_action, &QAction::triggered, m_dock_menu, [] {
+            Application::the().open_new_window(WebView::IsPrivate::No);
+        });
+
+        auto* new_private_window_action = m_dock_menu->addAction("New Private Window");
+        QObject::connect(new_private_window_action, &QAction::triggered, m_dock_menu, [] {
+            Application::the().open_new_window(WebView::IsPrivate::Yes);
+        });
+
+        bool added_window_separator = false;
+        for (auto* widget : QApplication::topLevelWidgets()) {
+            auto* window = as_if<BrowserWindow>(widget);
+            if (!window)
+                continue;
+
+            if (!added_window_separator) {
+                m_dock_menu->addSeparator();
+                added_window_separator = true;
+            }
+
+            auto title = window->windowTitle();
+            title.replace("&", "&&");
+            auto* action = m_dock_menu->addAction(title);
+            action->setCheckable(true);
+            action->setChecked(window == Application::the().active_window_if_any());
+
+            QPointer<BrowserWindow> window_pointer = window;
+            QObject::connect(action, &QAction::triggered, m_dock_menu, [window = window_pointer] {
+                if (!window)
+                    return;
+
+                if (window->isMinimized())
+                    window->showNormal();
+                else
+                    window->show();
+
+                window->raise();
+                window->activateWindow();
+                Application::the().set_active_window(*window);
+            });
+        }
+    }
+
     QAction* add_application_menu_action(QMenu& menu, QString const& text, QList<QKeySequence> shortcuts)
     {
         auto* action = new QAction(text, m_application_menu_bar);
@@ -284,6 +353,7 @@ private:
     QMenu* m_history_menu { nullptr };
     QMenu* m_inspect_menu { nullptr };
     QMenu* m_debug_menu { nullptr };
+    QMenu* m_dock_menu { nullptr };
     QAction* m_reopen_recently_closed_tab_action { nullptr };
 #endif
 };
@@ -295,6 +365,16 @@ void Application::create_platform_options(WebView::BrowserOptions&, WebView::Req
 {
     web_content_options.config_path = Settings::the()->directory();
 }
+
+#if !defined(AK_OS_MACOS)
+// On macOS, WebContent resolves system-ui with CoreText, so the system font family is not sent there.
+Optional<String> Application::system_font_family() const
+{
+    if (!m_application)
+        return {};
+    return ak_string_from_qstring(QGuiApplication::font().family());
+}
+#endif
 
 Core::EventLoop& Application::create_platform_event_loop()
 {
@@ -336,6 +416,13 @@ BrowserWindow& Application::new_window(Vector<URL::URL> const& initial_urls, Win
 
     window->activateWindow();
     window->raise();
+
+    size_t initial_url_index = 0;
+    window->for_each_tab([&](Tab& tab) {
+        if (initial_url_index < initial_urls.size())
+            tab.navigate(initial_urls[initial_url_index++]);
+    });
+
     if (should_focus_location_editor) {
         QTimer::singleShot(0, window, [window] {
             if (auto* tab = window->current_tab())
@@ -383,7 +470,7 @@ void Application::open_new_tab()
         return;
     }
 
-    auto& tab = m_active_window->new_tab_from_url(WebView::Application::settings().new_tab_page_url(), Web::HTML::ActivateTab::Yes);
+    auto& tab = m_active_window->new_tab_from_url(WebView::Application::settings().new_tab_page_url(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::end());
     tab.set_url_is_hidden(true);
     tab.focus_location_editor();
 }
@@ -392,6 +479,17 @@ void Application::open_new_window(WebView::IsPrivate is_private)
 {
     // FIXME: Create a new tab page specific to private windows.
     new_window({ WebView::Application::settings().new_tab_page_url() }, configuration_for_new_window(), BrowserWindow::IsPopupWindow::No, is_private);
+}
+
+void Application::restart_private_browsing_session()
+{
+    for (auto* widget : QApplication::topLevelWidgets()) {
+        if (auto* window = as_if<BrowserWindow>(widget); window && window->is_private() == WebView::IsPrivate::Yes)
+            window->close();
+    }
+
+    WebView::Application::the().reset_private_browsing_session();
+    open_new_window(WebView::IsPrivate::Yes);
 }
 
 void Application::focus_location_editor()
@@ -413,10 +511,12 @@ void Application::reopen_recently_closed_tab()
             auto& window = new_window(recently_closed_entry->urls);
             window.activate_tab(static_cast<int>(recently_closed_entry->active_tab_index));
         } else if (!recently_closed_entry->urls.is_empty()) {
-            if (!m_active_window || m_active_window->is_private() == WebView::IsPrivate::Yes)
+            if (!m_active_window || m_active_window->is_private() == WebView::IsPrivate::Yes) {
                 new_window({ recently_closed_entry->urls[0] });
-            else
-                m_active_window->new_tab_from_url(recently_closed_entry->urls[0], Web::HTML::ActivateTab::Yes);
+            } else {
+                // FIXME: Reopen the tab in its previous location.
+                m_active_window->new_tab_from_url(recently_closed_entry->urls[0], Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::end());
+            }
         }
     }
     update_reopen_recently_closed_actions();
@@ -475,8 +575,10 @@ bool Application::confirm_cancel_active_downloads(QWidget* parent)
 void Application::initialize_macos_application_menu()
 {
 #if defined(AK_OS_MACOS)
-    if (m_application)
+    if (m_application) {
         static_cast<LadybirdQApplication*>(m_application.ptr())->create_application_menu_bar();
+        static_cast<LadybirdQApplication*>(m_application.ptr())->create_dock_menu();
+    }
 #endif
 }
 
@@ -504,6 +606,24 @@ Optional<WebView::ViewImplementation&> Application::active_web_view() const
     return {};
 }
 
+Vector<WebView::ViewImplementation&> Application::active_window_web_views() const
+{
+    if (!m_active_window)
+        return {};
+
+    Vector<WebView::ViewImplementation&> web_views;
+    m_active_window->for_each_tab([&](Tab& tab) { web_views.append(tab.view()); });
+
+    return web_views;
+}
+
+bool Application::activate_tab_with_url(URL::URL const& url) const
+{
+    if (!m_active_window)
+        return false;
+    return m_active_window->activate_tab_with_url(url);
+}
+
 Optional<WebView::ViewImplementation&> Application::open_blank_new_tab(Web::HTML::ActivateTab activate_tab) const
 {
     if (!m_active_window) {
@@ -513,7 +633,7 @@ Optional<WebView::ViewImplementation&> Application::open_blank_new_tab(Web::HTML
         return {};
     }
 
-    auto& tab = active_window().create_new_tab(activate_tab);
+    auto& tab = active_window().create_new_tab(activate_tab, BrowserWindow::TabLocation::end());
     return tab.view();
 }
 
@@ -524,20 +644,38 @@ void Application::open_url_in_new_tab(URL::URL const& url, Web::HTML::ActivateTa
         return;
     }
 
-    active_window().new_tab_from_url(url, activate_tab);
+    active_window().new_tab_from_url(url, activate_tab, BrowserWindow::TabLocation::after_current_tab());
 }
 
-bool Application::activate_tab_with_url(URL::URL const& url) const
+void Application::open_urls_in_new_tabs(ReadonlySpan<URL::URL> urls) const
 {
-    if (!m_active_window)
-        return false;
-    return m_active_window->activate_tab_with_url(url);
+    if (urls.is_empty())
+        return;
+
+    if (!m_active_window) {
+        Vector<URL::URL> initial_urls;
+        initial_urls.ensure_capacity(urls.size());
+        for (auto const& url : urls)
+            initial_urls.append(url);
+
+        const_cast<Application&>(*this).new_window(initial_urls);
+        return;
+    }
+
+    auto& window = active_window();
+    auto* previous_tab = window.current_tab();
+    for (auto const& url : urls) {
+        auto location = previous_tab
+            ? BrowserWindow::TabLocation::after_tab(*previous_tab)
+            : BrowserWindow::TabLocation::end();
+        auto& tab = window.new_tab_from_url(url, Web::HTML::ActivateTab::No, location);
+        previous_tab = &tab;
+    }
 }
 
-void Application::open_url_in_new_window(URL::URL const& url)
+void Application::open_url_in_new_window(URL::URL const& url, WebView::IsPrivate is_private)
 {
-    auto is_private = m_active_window ? m_active_window->is_private() : WebView::IsPrivate::No;
-    this->new_window({ url }, configuration_for_new_window(), BrowserWindow::IsPopupWindow::No, is_private);
+    new_window({ url }, configuration_for_new_window(), BrowserWindow::IsPopupWindow::No, is_private);
 }
 
 Optional<ByteString> Application::ask_user_for_download_path(ByteString const& file) const
@@ -741,24 +879,6 @@ Optional<Application::BookmarkID> Application::bookmark_item_id_for_context_menu
     return {};
 }
 
-Vector<WebView::BookmarkItem::Bookmark> Application::bookmarks_for_all_tabs() const
-{
-    Vector<WebView::BookmarkItem::Bookmark> bookmarks;
-
-    if (!m_active_window)
-        return bookmarks;
-
-    m_active_window->for_each_tab([&](Tab& tab) {
-        bookmarks.append(WebView::BookmarkItem::Bookmark {
-            .url = tab.view().url(),
-            .title = tab.title().isEmpty() ? Optional<String> {} : ak_string_from_qstring(tab.title()),
-            .favicon_base64_png = tab.view().favicon_base64_png(),
-        });
-    });
-
-    return bookmarks;
-}
-
 static void add_bookmark_folder_options(QComboBox& folder_combo, ReadonlySpan<WebView::BookmarkItem> items, QString const& prefix, Optional<String const&> selected_folder_id)
 {
     for (auto const& item : items) {
@@ -956,12 +1076,6 @@ NonnullRefPtr<Application::BookmarkFolderPromise> Application::display_add_bookm
 NonnullRefPtr<Application::BookmarkFolderPromise> Application::display_edit_bookmark_folder_dialog(WebView::BookmarkItem::Folder const& current_folder) const
 {
     return display_add_or_edit_bookmark_folder_dialog<BookmarkFolderPromise>(active_tab(), "Edit Folder", current_folder.title);
-}
-
-String Application::suggested_bookmark_all_tabs_folder_title() const
-{
-    auto title = QString("Saved Tabs %1").arg(QDate::currentDate().toString(Qt::ISODate));
-    return ak_string_from_qstring(title);
 }
 
 void Application::on_devtools_enabled() const

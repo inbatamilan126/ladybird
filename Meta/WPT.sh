@@ -316,6 +316,36 @@ cleanup_run_infra() {
     done
 }
 
+clear_processes_using_path() {
+    local path="$1"
+    local signal="$2"
+    local action="$3"
+    local timeout_seconds="$4"
+    local deadline=$((SECONDS + timeout_seconds))
+    local pids_in_use
+
+    readarray -t pids_in_use < <(sudo_and_ask "" lsof -t "$path" 2>/dev/null | sort -nu)
+    if [ "${#pids_in_use[@]}" = 0 ]; then
+        return 0
+    fi
+
+    echo "Trying to $action procs holding $path: ${pids_in_use[*]}"
+    kill "-$signal" "${pids_in_use[@]}" 2>/dev/null || true
+    while true; do
+        readarray -t pids_in_use < <(sudo_and_ask "" lsof -t "$path" 2>/dev/null | sort -nu)
+        if [ "${#pids_in_use[@]}" = 0 ]; then
+            return 0
+        fi
+
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "Timed out waiting for procs holding $path to exit: ${pids_in_use[*]}"
+            return 1
+        fi
+
+        sleep 0.1
+    done
+}
+
 cleanup_run_dirs() {
     readarray -t dirs < <(ls "${BUILD_DIR}/wpt" 2>/dev/null)
     if [ "${#dirs}" = 0 ]; then
@@ -325,15 +355,18 @@ cleanup_run_dirs() {
     echo "Cleaning run dirs: ${dirs[*]}"
     for dir in "${dirs[@]}"; do
         mount_path="${BUILD_DIR}/wpt/$dir/merged"
-        for _ in $(seq 1 5); do
-            readarray -t pids_in_use < <(sudo_and_ask "" lsof "$mount_path" 2>/dev/null | cut -f2 -d' ')
-            [ "${#pids_in_use[@]}" = 0 ] && break
-                echo Trying to kill procs: "${pids_in_use[@]}"
-                kill -INT "${pids_in_use[@]}" 2>/dev/null || true
-        done
-        sudo_and_ask "" umount "$mount_path" || true
+        if ! mountpoint -q "$mount_path"; then
+            continue
+        fi
+
+        clear_processes_using_path "$mount_path" TERM terminate 5 \
+            || clear_processes_using_path "$mount_path" KILL kill 5 \
+            || true
+
+        sudo_and_ask "" umount "$mount_path" || echo "Failed to unmount $mount_path"
     done
-    rm -fr "${BUILD_DIR}/wpt"
+    # Overlayfs can leave root-owned internal state in the workdir because we mount it via sudo.
+    sudo_and_ask "" rm -fr "${BUILD_DIR}/wpt"
 }
 
 cleanup_merge_dirs_and_infra() {
@@ -540,7 +573,7 @@ run_wpt_chunked() {
             run \
             --this-chunk="$((i + 1))" \
             --total-chunks="$procs" \
-            --chunk-type=hash \
+            --chunk-type=id_hash \
             -f \
             --browser-version="1.0-$(ladybird_git_hash)"
             --processes="$concurrency" \

@@ -22,6 +22,7 @@
 #include <LibWeb/HTML/EventLoop/Task.h>
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/HTML/MediaControls.h>
+#include <LibWeb/Page/ScreenWakeLockHandle.h>
 #include <LibWeb/Painting/DisplayListResourceIds.h>
 #include <LibWeb/PixelUnits.h>
 #include <LibWeb/WebIDL/DOMException.h>
@@ -186,7 +187,7 @@ protected:
     virtual void finalize() override;
     virtual void visit_edges(Cell::Visitor&) override;
 
-    virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
     virtual void removed_from(IsSubtreeRoot, DOM::Node* old_ancestor, DOM::Node& old_root) override;
     virtual void adopted_from(DOM::Document&) override;
     virtual void children_changed(ChildrenChangedMetadata const& metadata) override;
@@ -195,7 +196,6 @@ private:
     friend SourceElementSelector;
 
     struct RemoteFetchData;
-
     virtual bool is_html_media_element() const final { return true; }
 
     struct EntireResource { };
@@ -216,8 +216,15 @@ private:
     void load_url_resource(URL::URL const&, ESCAPING Function<void(String)> failure_callback);
     void load_remote_resource(ByteRange const&);
     void load_local_resource(MediaProviderObject const&, ESCAPING Function<void(String)> failure_callback);
+    bool preload_attribute_is_in_none_state() const;
+    bool should_wait_for_an_implementation_defined_event_before_fetching_the_resource() const;
+    void wait_for_an_implementation_defined_event_before_fetching_the_resource(u32 fetch_generation);
+    void continue_fetching_the_resource_after_an_implementation_defined_event();
+    void run_remote_mode_resource_fetch_steps(ByteRange, u32 fetch_generation);
 
     Optional<String> verify_response_or_get_failure_reason(GC::Ref<Fetch::Infrastructure::Response>, ByteRange const&);
+    bool should_hold_screen_wake_lock() const;
+    void update_screen_wake_lock();
 
     void restart_fetch_at_offset(u64 offset);
 
@@ -379,10 +386,12 @@ private:
 
     OwnPtr<RemoteFetchData> m_remote_fetch_data;
     u32 m_current_fetch_generation { 0 };
+    bool m_waiting_for_an_implementation_defined_event_to_fetch_the_resource { false };
 
     OwnPtr<Media::PlaybackManager> m_playback_manager;
     GC::Ptr<VideoTrack> m_selected_video_track;
     RefPtr<Media::DisplayingVideoSink> m_selected_video_track_sink;
+    Optional<ScreenWakeLockHandle> m_screen_wake_lock;
 
     bool m_loop_was_specified_when_reaching_end_of_media_resource { false };
 

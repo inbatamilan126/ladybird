@@ -29,6 +29,7 @@
 #include <LibWeb/Clipboard/SystemClipboard.h>
 #include <LibWeb/Compositor/Types.h>
 #include <LibWeb/HTML/ActivateTab.h>
+#include <LibWeb/HTML/NavigableId.h>
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/FileDownloader.h>
 #include <LibWebView/Forward.h>
@@ -71,18 +72,41 @@ public:
     static RequestServerOptions const& request_server_options() { return the().m_request_server_options; }
     static WebContentOptions& web_content_options() { return the().m_web_content_options; }
 
+    virtual Optional<String> system_font_family() const { return {}; }
+
     static Requests::RequestClient& request_server_client(IsPrivate = IsPrivate::No);
     static ImageDecoderClient::Client& image_decoder_client() { return *the().m_image_decoder_client; }
 
     virtual bool supports_vertical_tabs() const { return false; }
-    virtual bool supports_server_side_window_decorations() const { return false; }
+    virtual bool supports_private_browsing_windows() const { return false; }
+    virtual bool supports_client_side_window_decorations() const { return false; }
     void tab_settings_changed(Badge<ApplicationSettingsObserver>);
 
     static BookmarkStore& bookmark_store() { return the().m_bookmark_store; }
     void update_bookmark_action_for_current_web_view();
     void bookmarks_changed(Badge<ApplicationBookmarkStoreObserver>);
     void show_bookmarks_bar_changed(Badge<ApplicationSettingsObserver>);
+
+    struct BookmarkID {
+        String id;
+        Optional<String> target_folder_id;
+    };
+    virtual Optional<BookmarkID> bookmark_item_id_for_context_menu() const { return {}; }
     virtual void show_bookmark_context_menu(Gfx::IntPoint, Optional<BookmarkItem const&>, [[maybe_unused]] Optional<String const&> target_folder_id) { }
+
+    struct AddBookmarkDialogResult {
+        BookmarkItem::Bookmark bookmark;
+        Optional<String> target_folder_id;
+    };
+    using AddBookmarkPromise = Core::Promise<AddBookmarkDialogResult>;
+    virtual NonnullRefPtr<AddBookmarkPromise> display_add_bookmark_dialog(Optional<String const&> target_folder_id = {}) const;
+
+    using BookmarkPromise = Core::Promise<BookmarkItem::Bookmark>;
+    virtual NonnullRefPtr<BookmarkPromise> display_edit_bookmark_dialog([[maybe_unused]] BookmarkItem::Bookmark const& current_bookmark) const;
+
+    using BookmarkFolderPromise = Core::Promise<BookmarkItem::Folder>;
+    virtual NonnullRefPtr<BookmarkFolderPromise> display_add_bookmark_folder_dialog(Optional<String const&> default_title = {}) const;
+    virtual NonnullRefPtr<BookmarkFolderPromise> display_edit_bookmark_folder_dialog([[maybe_unused]] BookmarkItem::Folder const& current_folder) const;
 
     static HistoryStore& history_store(IsPrivate);
     static CookieJar& cookie_jar(IsPrivate);
@@ -100,10 +124,12 @@ public:
         NonnullRefPtr<WebContentClient> client;
         u64 page_id { 0 };
     };
-    ErrorOr<ChildFrameWebContentProcess> launch_child_frame_web_content_process(IsPrivate);
+    ErrorOr<ChildFrameWebContentProcess> launch_child_frame_web_content_process(IsPrivate, Web::HTML::NavigableId root_navigable_id);
     u64 allocate_page_id();
+    Web::HTML::NavigableIdAllocator allocate_navigable_id_allocator();
 
     void maybe_close_private_browsing_session();
+    void reset_private_browsing_session();
 
     Web::Compositor::CompositorContextId allocate_compositor_context_id();
     ErrorOr<void> connect_web_content_to_compositor(WebContentClient&);
@@ -118,13 +144,19 @@ public:
     void notify_compositor_presented_bitmap_ready_to_paint(Web::Compositor::CompositorContextId, i32 bitmap_id);
 
     virtual Optional<ViewImplementation&> active_web_view() const { return {}; }
-    virtual Optional<ViewImplementation&> open_blank_new_tab(Web::HTML::ActivateTab) const { return {}; }
+    virtual Vector<ViewImplementation&> active_window_web_views() const { return {}; }
     virtual bool activate_tab_with_url(URL::URL const&) const { return false; }
+
+    virtual Optional<ViewImplementation&> open_blank_new_tab(Web::HTML::ActivateTab) const { return {}; }
     virtual void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab) const;
+    virtual void open_urls_in_new_tabs(ReadonlySpan<URL::URL>) const;
+    virtual void open_url_in_new_window(URL::URL const&, IsPrivate) { }
+
     void open_bookmark_in_new_tab(String const& bookmark_id, Web::HTML::ActivateTab) const;
+    void open_bookmark_folder_in_new_tabs(String const& folder_id) const;
+    void open_bookmark_in_new_window(String const& bookmark_id, IsPrivate);
 
     Main::Arguments const& command_line_arguments() const { return m_arguments; }
-    virtual void open_url_in_new_window(URL::URL const& url);
 
     void add_child_process(Process&&);
 
@@ -202,9 +234,6 @@ public:
     Action& toggle_menu_bar_action() { return *m_toggle_menu_bar_action; }
 
     Menu& bookmarks_menu() { return *m_bookmarks_menu; }
-    Menu& bookmarks_bar_context_menu() { return *m_bookmarks_bar_context_menu; }
-    Menu& bookmark_context_menu() { return *m_bookmark_context_menu; }
-    Menu& bookmark_folder_context_menu() { return *m_bookmark_folder_context_menu; }
     void toggle_bookmark_for_view(ViewImplementation&);
 
     Menu& history_menu() { return *m_history_menu; }
@@ -239,37 +268,16 @@ protected:
     virtual void update_tabs_display() const { }
 
     virtual void rebuild_bookmarks_menu() const { }
+
     virtual void on_recently_closed_entries_changed() const { }
-
-    struct BookmarkID {
-        String id;
-        Optional<String> target_folder_id;
-    };
-    virtual Optional<BookmarkID> bookmark_item_id_for_context_menu() const { return {}; }
-
-    struct AddBookmarkDialogResult {
-        BookmarkItem::Bookmark bookmark;
-        Optional<String> target_folder_id;
-    };
-    using AddBookmarkPromise = Core::Promise<AddBookmarkDialogResult>;
-    virtual NonnullRefPtr<AddBookmarkPromise> display_add_bookmark_dialog(Optional<String const&> target_folder_id = {}) const;
-
-    using BookmarkPromise = Core::Promise<BookmarkItem::Bookmark>;
-    virtual NonnullRefPtr<BookmarkPromise> display_edit_bookmark_dialog([[maybe_unused]] BookmarkItem::Bookmark const& current_bookmark) const;
-
-    using BookmarkFolderPromise = Core::Promise<BookmarkItem::Folder>;
-    virtual NonnullRefPtr<BookmarkFolderPromise> display_add_bookmark_folder_dialog(Optional<String const&> default_title = {}) const;
-    virtual NonnullRefPtr<BookmarkFolderPromise> display_edit_bookmark_folder_dialog([[maybe_unused]] BookmarkItem::Folder const& current_folder) const;
-    virtual String suggested_bookmark_all_tabs_folder_title() const;
 
     virtual void on_devtools_enabled() const;
     virtual void on_devtools_disabled() const;
-    virtual Vector<BookmarkItem::Bookmark> bookmarks_for_all_tabs() const { return {}; }
 
     Main::Arguments& arguments() { return m_arguments; }
 
 private:
-    ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(Optional<ViewImplementation&>, IsPrivate, u64 initial_page_id);
+    ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(Optional<ViewImplementation&>, IsPrivate, u64 initial_page_id, Optional<Web::HTML::NavigableId> root_navigable_id = {});
     PrivateBrowsingSession& ensure_private_browsing_session();
     ErrorOr<void> launch_services();
     void launch_spare_web_content_process();
@@ -291,6 +299,8 @@ private:
         Optional<String const&> target_folder_id;
     };
     void create_bookmark_menu_items(Optional<MenuData> = {});
+
+    Vector<BookmarkItem::Bookmark> bookmarks_for_all_tabs_in_current_window() const;
 
     virtual Vector<DevTools::TabDescription> tab_list() const override;
     virtual Vector<DevTools::CSSProperty> css_property_list() const override;
@@ -339,9 +349,9 @@ private:
     virtual void get_dom_node_outer_html(DevTools::TabDescription const&, Web::UniqueNodeID, OnDOMNodeHTMLReceived) const override;
     virtual void set_dom_node_outer_html(DevTools::TabDescription const&, Web::UniqueNodeID, String const&, OnDOMNodeEditComplete) const override;
     virtual void set_dom_node_text(DevTools::TabDescription const&, Web::UniqueNodeID, String const&, OnDOMNodeEditComplete) const override;
-    virtual void set_dom_node_tag(DevTools::TabDescription const&, Web::UniqueNodeID, String const&, OnDOMNodeEditComplete) const override;
+    virtual void set_dom_node_tag(DevTools::TabDescription const&, Web::UniqueNodeID, Utf16FlyString const&, OnDOMNodeEditComplete) const override;
     virtual void add_dom_node_attributes(DevTools::TabDescription const&, Web::UniqueNodeID, ReadonlySpan<Attribute>, OnDOMNodeEditComplete) const override;
-    virtual void replace_dom_node_attribute(DevTools::TabDescription const&, Web::UniqueNodeID, String const&, ReadonlySpan<Attribute>, OnDOMNodeEditComplete) const override;
+    virtual void replace_dom_node_attribute(DevTools::TabDescription const&, Web::UniqueNodeID, Utf16FlyString const&, ReadonlySpan<Attribute>, OnDOMNodeEditComplete) const override;
     virtual void create_child_element(DevTools::TabDescription const&, Web::UniqueNodeID, OnDOMNodeEditComplete) const override;
     virtual void insert_dom_node_before(DevTools::TabDescription const&, Web::UniqueNodeID, Web::UniqueNodeID, Optional<Web::UniqueNodeID>, OnDOMNodeEditComplete) const override;
     virtual void clone_dom_node(DevTools::TabDescription const&, Web::UniqueNodeID, OnDOMNodeEditComplete) const override;
@@ -395,6 +405,7 @@ private:
     RefPtr<WebContentClient> m_spare_web_content_process;
     bool m_has_queued_task_to_launch_spare_web_content_process { false };
     u64 m_next_page_or_compositor_context_id { 1 };
+    u64 m_next_navigable_id_namespace { 1 };
 
     RefPtr<Database::Database> m_database;
     RefPtr<Database::Database> m_history_database;
@@ -438,10 +449,6 @@ private:
     RefPtr<Action> m_toggle_bookmark_action;
     RefPtr<Action> m_toggle_bookmark_bar_action;
     size_t m_bookmarks_menu_static_size { 0 };
-
-    RefPtr<Menu> m_bookmarks_bar_context_menu;
-    RefPtr<Menu> m_bookmark_context_menu;
-    RefPtr<Menu> m_bookmark_folder_context_menu;
 
     RefPtr<Menu> m_history_menu;
 

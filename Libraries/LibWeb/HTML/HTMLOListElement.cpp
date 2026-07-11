@@ -31,7 +31,7 @@ void HTMLOListElement::initialize(JS::Realm& realm)
     Base::initialize(realm);
 }
 
-void HTMLOListElement::attribute_changed(FlyString const& local_name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void HTMLOListElement::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(local_name, old_value, value, namespace_);
 
@@ -46,7 +46,7 @@ void HTMLOListElement::attribute_changed(FlyString const& local_name, Optional<S
 WebIDL::Long HTMLOListElement::start()
 {
     // The start IDL attribute must reflect the content attribute of the same name, with a default value of 1.
-    auto content_attribute_value = get_attribute(AttributeNames::start).value_or("1"_string);
+    auto content_attribute_value = get_attribute(AttributeNames::start).value_or("1"_utf16);
     if (auto maybe_number = HTML::parse_integer(content_attribute_value); maybe_number.has_value())
         return *maybe_number;
     return 1;
@@ -54,7 +54,7 @@ WebIDL::Long HTMLOListElement::start()
 
 void HTMLOListElement::set_start(WebIDL::Long start)
 {
-    set_attribute_value(AttributeNames::start, String::number(start));
+    set_attribute_value(AttributeNames::start, Utf16String::number(start));
 }
 
 // https://html.spec.whatwg.org/multipage/grouping-content.html#concept-ol-start
@@ -81,7 +81,7 @@ AK::Checked<i32> HTMLOListElement::starting_value() const
     return 1;
 }
 
-bool HTMLOListElement::is_presentational_hint(FlyString const& name) const
+bool HTMLOListElement::is_presentational_hint(Utf16FlyString const& name) const
 {
     if (Base::is_presentational_hint(name))
         return true;
@@ -97,15 +97,15 @@ void HTMLOListElement::apply_presentational_hints(Vector<CSS::StyleProperty>& pr
     for_each_attribute([&](auto& name, auto& value) {
         if (name == HTML::AttributeNames::type) {
             if (value == "1"sv) {
-                properties.append({ .property_id = CSS::PropertyID::ListStyleType, .value = CSS::CounterStyleStyleValue::create("decimal"_fly_string) });
+                properties.append({ .property_id = CSS::PropertyID::ListStyleType, .value = CSS::CounterStyleStyleValue::create("decimal"_utf16_fly_string) });
             } else if (value == "a"sv) {
-                properties.append({ .property_id = CSS::PropertyID::ListStyleType, .value = CSS::CounterStyleStyleValue::create("lower-alpha"_fly_string) });
+                properties.append({ .property_id = CSS::PropertyID::ListStyleType, .value = CSS::CounterStyleStyleValue::create("lower-alpha"_utf16_fly_string) });
             } else if (value == "A"sv) {
-                properties.append({ .property_id = CSS::PropertyID::ListStyleType, .value = CSS::CounterStyleStyleValue::create("upper-alpha"_fly_string) });
+                properties.append({ .property_id = CSS::PropertyID::ListStyleType, .value = CSS::CounterStyleStyleValue::create("upper-alpha"_utf16_fly_string) });
             } else if (value == "i"sv) {
-                properties.append({ .property_id = CSS::PropertyID::ListStyleType, .value = CSS::CounterStyleStyleValue::create("lower-roman"_fly_string) });
+                properties.append({ .property_id = CSS::PropertyID::ListStyleType, .value = CSS::CounterStyleStyleValue::create("lower-roman"_utf16_fly_string) });
             } else if (value == "I"sv) {
-                properties.append({ .property_id = CSS::PropertyID::ListStyleType, .value = CSS::CounterStyleStyleValue::create("upper-roman"_fly_string) });
+                properties.append({ .property_id = CSS::PropertyID::ListStyleType, .value = CSS::CounterStyleStyleValue::create("upper-roman"_utf16_fly_string) });
             }
         }
     });

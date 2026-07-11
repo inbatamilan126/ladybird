@@ -60,6 +60,7 @@ private:
         Optional<CSS::FlexBasis> used_flex_basis {};
         bool used_flex_basis_is_definite { false };
         bool main_size_was_resolved_from_aspect_ratio { false };
+        bool cross_size_was_resolved_from_aspect_ratio { false };
         CSSPixels flex_base_size { 0 };
         CSSPixels hypothetical_main_size { 0 };
         CSSPixels hypothetical_cross_size { 0 };
@@ -166,7 +167,6 @@ private:
     void set_cross_size(Box const&, CSSPixels size);
     void set_main_size(FlexItem&, CSSPixels size);
     void set_cross_size(FlexItem&, CSSPixels size);
-    void set_offset(FlexItem&, CSSPixels main_offset, CSSPixels cross_offset);
 
     void set_main_axis_first_margin(FlexItem&, CSSPixels margin);
     void set_main_axis_second_margin(FlexItem&, CSSPixels margin);

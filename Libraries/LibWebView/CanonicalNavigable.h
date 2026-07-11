@@ -17,6 +17,8 @@
 #include <AK/Vector.h>
 #include <AK/Weakable.h>
 #include <LibURL/URL.h>
+#include <LibWeb/HTML/NavigableId.h>
+#include <LibWeb/HTML/ReplicatedNavigableState.h>
 #include <LibWeb/PixelUnits.h>
 #include <LibWebView/Export.h>
 #include <LibWebView/Forward.h>
@@ -37,13 +39,14 @@ public:
         Optional<u64> remote_page_id;
     };
 
-    CanonicalNavigable(String id, String parent_id, RefPtr<WebContentClient> reporting_client, u64 reporting_page_id);
+    CanonicalNavigable(Web::HTML::NavigableId id, Optional<Web::HTML::NavigableId> parent_id, RefPtr<WebContentClient> reporting_client, u64 reporting_page_id);
     virtual ~CanonicalNavigable();
 
     virtual bool is_top_level_traversable() const { return false; }
 
-    String const& id() const { return m_id; }
-    String const& parent_id() const { return m_parent_id; }
+    Web::HTML::NavigableId id() const { return m_id; }
+    Optional<Web::HTML::NavigableId> parent_id() const { return m_parent_id; }
+    void set_id(Web::HTML::NavigableId id) { m_id = id; }
 
     // The WebContent process and page whose document tree contains this frame. When the
     // frame is local, this process also hosts the frame's active document.
@@ -75,22 +78,24 @@ public:
     double device_pixel_ratio() const { return m_device_pixel_ratio; }
     void set_viewport(Web::DevicePixelRect, double device_pixel_ratio);
 
-    void did_commit_navigation(URL::URL);
-    Optional<URL::URL> document_url() const;
+    Optional<Web::HTML::ReplicatedNavigableState> const& replicated_state() const { return m_replicated_state; }
+    void set_replicated_state(Web::HTML::ReplicatedNavigableState);
+
+    void did_commit_navigation(Web::HTML::ReplicatedNavigableState);
 
     void record_pending_navigation(URL::URL const&, HostLocality, Optional<u64> remote_page_id = {});
     void clear_pending_navigation() { m_pending_navigation.clear(); }
     bool has_matching_pending_navigation(URL::URL const&, HostLocality) const;
 
 private:
-    String m_id;
-    String m_parent_id;
+    Web::HTML::NavigableId m_id;
+    Optional<Web::HTML::NavigableId> m_parent_id;
     RefPtr<WebContentClient> m_reporting_client;
     u64 m_reporting_page_id { 0 };
     CanonicalNavigable* m_parent { nullptr };
     Vector<NonnullOwnPtr<CanonicalNavigable>> m_children;
 
-    Optional<URL::URL> m_last_committed_url;
+    Optional<Web::HTML::ReplicatedNavigableState> m_replicated_state;
     Optional<PendingNavigation> m_pending_navigation;
     Optional<Web::DevicePixelRect> m_viewport_rect;
     double m_device_pixel_ratio { 1 };

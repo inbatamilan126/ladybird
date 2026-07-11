@@ -225,8 +225,13 @@ static void initialize_native_icon(WebView::Action& action, id control)
         set_control_image(control, @"arrow.clockwise");
         [control setKeyEquivalent:@"r"];
         break;
+    case WebView::ActionID::ViewDownloads:
+        set_control_image(control, @"arrow.down.circle");
+        [control setKeyEquivalent:@"j"];
+        break;
     case WebView::ActionID::ViewHistory:
         set_control_image(control, @"clock");
+        [control setKeyEquivalent:@"y"];
         break;
     case WebView::ActionID::ClearBrowsingData:
         set_control_image(control, @"trash");
@@ -251,6 +256,7 @@ static void initialize_native_icon(WebView::Action& action, id control)
         [control setKeyEquivalent:@"a"];
         break;
 
+    case WebView::ActionID::LookUpSelectedText:
     case WebView::ActionID::SearchSelectedText:
         set_control_image(control, @"magnifyingglass");
         break;
@@ -260,6 +266,10 @@ static void initialize_native_icon(WebView::Action& action, id control)
         break;
     case WebView::ActionID::ToggleBookmark:
         [control setKeyEquivalent:@"d"];
+        break;
+    case WebView::ActionID::AddBookmarkAllTabs:
+        set_control_image(control, @"square.badge.plus");
+        [control setKeyEquivalent:@"D"];
         break;
     case WebView::ActionID::ToggleBookmarksBar:
         set_control_image(control, @"line.horizontal.star.fill.line.horizontal");
@@ -302,6 +312,9 @@ static void initialize_native_icon(WebView::Action& action, id control)
         break;
     case WebView::ActionID::OpenInNewWindow:
         set_control_image(control, @"macwindow.badge.plus");
+        break;
+    case WebView::ActionID::OpenInNewPrivateWindow:
+        set_control_image(control, @"eyeglasses");
         break;
     case WebView::ActionID::CopyURL:
         set_control_image(control, @"document.on.document");
@@ -475,7 +488,12 @@ NSMenuItem* create_application_menu_item(WebView::Menu& menu)
 
 NSButton* create_application_button(WebView::Action& action)
 {
-    auto* button = [[NSButton alloc] init];
+    return create_application_button(action, [NSButton class]);
+}
+
+NSButton* create_application_button(WebView::Action& action, Class button_class)
+{
+    NSButton* button = [[button_class alloc] init];
     initialize_native_control(action, button);
     set_properties(button, action);
     return button;

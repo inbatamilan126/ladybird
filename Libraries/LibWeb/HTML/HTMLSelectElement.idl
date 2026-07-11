@@ -3,11 +3,11 @@
 interface HTMLSelectElement : HTMLElement {
     [HTMLConstructor] constructor();
 
-    [CEReactions] attribute DOMString autocomplete;
+    [CEReactions] attribute Utf16DOMString autocomplete;
     [CEReactions, Reflect] attribute boolean disabled;
     readonly attribute HTMLFormElement? form;
     [CEReactions, Reflect] attribute boolean multiple;
-    [CEReactions, Reflect] attribute DOMString name;
+    [CEReactions, Reflect] attribute Utf16DOMString name;
     [CEReactions, Reflect] attribute boolean required;
     [CEReactions] attribute unsigned long size;
 
@@ -16,7 +16,7 @@ interface HTMLSelectElement : HTMLElement {
     [SameObject] readonly attribute HTMLOptionsCollection options;
     [CEReactions] attribute unsigned long length;
     getter HTMLOptionElement? item(unsigned long index);
-    HTMLOptionElement? namedItem(DOMString name);
+    HTMLOptionElement? namedItem(Utf16DOMString name);
     [CEReactions] undefined add((HTMLOptionElement or HTMLOptGroupElement) element, optional (HTMLElement or long)? before = null);
     [CEReactions] undefined remove(); // ChildNode overload
     [CEReactions] undefined remove(long index);

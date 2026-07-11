@@ -291,7 +291,7 @@ void HTMLTextAreaElement::set_cols(WebIDL::UnsignedLong cols)
     if (cols == 0 || cols > 2147483647)
         cols = 20;
 
-    set_attribute_value(HTML::AttributeNames::cols, String::number(cols));
+    set_attribute_value(HTML::AttributeNames::cols, Utf16String::number(cols));
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-rows
@@ -310,7 +310,7 @@ void HTMLTextAreaElement::set_rows(WebIDL::UnsignedLong rows)
     if (rows == 0 || rows > 2147483647)
         rows = 2;
 
-    set_attribute_value(HTML::AttributeNames::rows, String::number(rows));
+    set_attribute_value(HTML::AttributeNames::rows, Utf16String::number(rows));
 }
 
 WebIDL::UnsignedLong HTMLTextAreaElement::selection_start_binding() const
@@ -385,7 +385,7 @@ void HTMLTextAreaElement::create_shadow_tree_if_needed()
     MUST(element->append_child(*m_placeholder_element));
     m_placeholder_element->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::Placeholder);
 
-    m_placeholder_text_node = realm().create<DOM::Text>(document(), Utf16String::from_utf8(get_attribute_value(HTML::AttributeNames::placeholder)));
+    m_placeholder_text_node = realm().create<DOM::Text>(document(), get_attribute_value(HTML::AttributeNames::placeholder));
     MUST(m_placeholder_element->append_child(*m_placeholder_text_node));
 
     update_placeholder_visibility();
@@ -458,11 +458,11 @@ void HTMLTextAreaElement::children_changed(ChildrenChangedMetadata const& metada
     }
 }
 
-void HTMLTextAreaElement::form_associated_element_attribute_changed(FlyString const& name, Optional<String> const&, Optional<String> const& value, Optional<FlyString> const&)
+void HTMLTextAreaElement::form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const&, Optional<Utf16String> const& value, Optional<Utf16FlyString> const&)
 {
     if (name == HTML::AttributeNames::placeholder) {
         if (m_placeholder_text_node)
-            m_placeholder_text_node->set_data(Utf16String::from_utf8(value.value_or(String {})));
+            m_placeholder_text_node->set_data(value.value_or({}));
         update_placeholder_visibility();
     } else if (name == HTML::AttributeNames::maxlength) {
         handle_maxlength_attribute();
@@ -528,7 +528,7 @@ bool HTMLTextAreaElement::is_mutable() const
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#attr-textarea-placeholder
-Optional<String> HTMLTextAreaElement::placeholder_value() const
+Optional<Utf16String> HTMLTextAreaElement::placeholder_value() const
 {
     if (!m_text_node || !m_text_node->data().is_empty())
         return {};

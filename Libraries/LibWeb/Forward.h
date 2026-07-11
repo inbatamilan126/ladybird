@@ -52,6 +52,8 @@ namespace Web::Painting {
 
 class AccumulatedVisualContextTree;
 class BackingStore;
+class Canvas2DCommandStream;
+struct Canvas2DCommandStreamSegment;
 class ChromeWidget;
 class CanvasSurfaceRegistry;
 class DevicePixelConverter;
@@ -422,6 +424,7 @@ class URL;
 class URLStyleValue;
 class VisualViewport;
 
+enum class FeatureComparison : u8;
 enum class FontFeatureValueType : u8;
 enum class Keyword : u16;
 enum class MediaFeatureID : u8;
@@ -882,7 +885,7 @@ class XMLSerializer;
 
 enum class AllowMultipleFiles;
 enum class RequireWellFormed;
-enum class SandboxingFlagSet;
+enum class SandboxingFlagSet : u32;
 
 struct Agent;
 struct BroadcastChannelMessage;
@@ -1042,6 +1045,7 @@ class FieldSetPaintable;
 class MediaPaintable;
 class Paintable;
 class Paintable;
+class PaintableFragment;
 class PaintableWithLines;
 class ScrollStateSnapshot;
 class StackingContext;

@@ -27,7 +27,9 @@
 #include <LibWeb/DOM/AccessibilityTreeNode.h>
 #include <LibWeb/DOM/Attr.h>
 #include <LibWeb/DOM/CDATASection.h>
+#include <LibWeb/DOM/CharacterData.h>
 #include <LibWeb/DOM/Comment.h>
+#include <LibWeb/DOM/DocumentFragment.h>
 #include <LibWeb/DOM/DocumentType.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/ElementFactory.h>
@@ -174,7 +176,7 @@ HTML::HTMLElement const* Node::enclosing_html_element() const
     return first_ancestor_of_type<HTML::HTMLElement>();
 }
 
-HTML::HTMLElement const* Node::enclosing_html_element_with_attribute(FlyString const& attribute) const
+HTML::HTMLElement const* Node::enclosing_html_element_with_attribute(Utf16FlyString const& attribute) const
 {
     for (auto* node = this; node; node = node->parent()) {
         if (auto* html_element = as_if<HTML::HTMLElement>(*node); html_element && html_element->has_attribute(attribute))
@@ -183,7 +185,7 @@ HTML::HTMLElement const* Node::enclosing_html_element_with_attribute(FlyString c
     return nullptr;
 }
 
-Optional<String> Node::alternative_text() const
+Optional<Utf16String> Node::alternative_text() const
 {
     return {};
 }
@@ -216,7 +218,7 @@ Optional<Utf16String> Node::text_content() const
 
     // If Attr node, return this's value.
     if (auto const* attribute = as_if<Attr>(*this))
-        return Utf16String::from_utf8(attribute->value());
+        return attribute->value();
 
     // Otherwise, return null
     return {};
@@ -245,7 +247,7 @@ WebIDL::ExceptionOr<void> Node::set_text_content(Optional<Utf16String> const& ma
 
     // If Attr, set an existing attribute value with this and the given value.
     else if (auto* attribute = as_if<Attr>(*this)) {
-        TRY(attribute->set_value(content.to_utf8_but_should_be_ported_to_utf16()));
+        TRY(attribute->set_value(content));
     }
 
     // Otherwise, do nothing.
@@ -374,7 +376,7 @@ WebIDL::ExceptionOr<void> Node::normalize()
 }
 
 // https://dom.spec.whatwg.org/#dom-node-nodevalue
-Optional<String> Node::node_value() const
+Optional<Utf16String> Node::node_value() const
 {
     // The nodeValue getter steps are to return the following, switching on the interface this implements:
 
@@ -385,7 +387,7 @@ Optional<String> Node::node_value() const
 
     // If CharacterData, return this’s data.
     if (auto* character_data = as_if<CharacterData>(this)) {
-        return character_data->data().to_utf8_but_should_be_ported_to_utf16();
+        return character_data->data();
     }
 
     // Otherwise, return null.
@@ -393,18 +395,18 @@ Optional<String> Node::node_value() const
 }
 
 // https://dom.spec.whatwg.org/#ref-for-dom-node-nodevalue%E2%91%A0
-WebIDL::ExceptionOr<void> Node::set_node_value(Optional<String> const& maybe_value)
+WebIDL::ExceptionOr<void> Node::set_node_value(Optional<Utf16String> const& maybe_value)
 {
     // The nodeValue setter steps are to, if the given value is null, act as if it was the empty string instead,
     // and then do as described below, switching on the interface this implements:
-    auto value = maybe_value.value_or(String {});
+    auto value = maybe_value.value_or({});
 
     // If Attr, set an existing attribute value with this and the given value.
     if (auto* attr = as_if<Attr>(this)) {
-        TRY(attr->set_value(move(value)));
+        TRY(attr->set_value(value));
     } else if (auto* character_data = as_if<CharacterData>(this)) {
         // If CharacterData, replace data with node this, offset 0, count this’s length, and data the given value.
-        character_data->set_data(Utf16String::from_utf8(value));
+        character_data->set_data(value);
     }
 
     // Otherwise, do nothing.
@@ -526,7 +528,7 @@ bool Node::is_browsing_context_connected() const
 }
 
 // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insertion-validity
-WebIDL::ExceptionOr<void> Node::ensure_pre_insertion_validity(JS::Realm& realm, GC::Ref<Node> node, GC::Ptr<Node> child) const
+WebIDL::ExceptionOr<void> Node::ensure_pre_insert_validity(JS::Realm& realm, GC::Ref<Node> node, GC::Ptr<Node> child, ChildrenToExclude children_to_exclude) const
 {
     // 1. If parent is not a Document, DocumentFragment, or Element node, then throw a "HierarchyRequestError" DOMException.
     if (!is<Document>(this) && !is<DocumentFragment>(this) && !is<Element>(this))
@@ -542,35 +544,104 @@ WebIDL::ExceptionOr<void> Node::ensure_pre_insertion_validity(JS::Realm& realm, 
 
     // FIXME: All the following "Invalid node type for insertion" messages could be more descriptive.
     // 4. If node is not a DocumentFragment, DocumentType, Element, or CharacterData node, then throw a "HierarchyRequestError" DOMException.
-    if (!is<DocumentFragment>(*node) && !is<DocumentType>(*node) && !is<Element>(*node) && !is<Text>(*node) && !is<Comment>(*node) && !is<ProcessingInstruction>(*node) && !is<CDATASection>(*node))
+    if (!is<DocumentFragment>(*node) && !is<DocumentType>(*node) && !is<Element>(*node) && !is<CharacterData>(*node))
         return WebIDL::HierarchyRequestError::create(realm, "Invalid node type for insertion"_utf16);
 
-    // 5. If either node is a Text node and parent is a document, or node is a doctype and parent is not a document, then throw a "HierarchyRequestError" DOMException.
-    if ((is<Text>(*node) && is<Document>(this)) || (is<DocumentType>(*node) && !is<Document>(this)))
-        return WebIDL::HierarchyRequestError::create(realm, "Invalid node type for insertion"_utf16);
-
-    // 6. If parent is a document, and any of the statements below, switched on the interface node implements, are true, then throw a "HierarchyRequestError" DOMException.
-    if (is<Document>(this)) {
-        // DocumentFragment
-        if (is<DocumentFragment>(*node)) {
-            // If node has more than one element child or has a Text node child.
-            // Otherwise, if node has one element child and either parent has an element child, child is a doctype, or child is non-null and a doctype is following child.
-            auto node_element_child_count = as<DocumentFragment>(*node).child_element_count();
-            if ((node_element_child_count > 1 || node->has_child_of_type<Text>())
-                || (node_element_child_count == 1 && (has_child_of_type<Element>() || is<DocumentType>(child.ptr()) || (child && child->has_following_node_of_type_in_tree_order<DocumentType>())))) {
-                return WebIDL::HierarchyRequestError::create(realm, "Invalid node type for insertion"_utf16);
-            }
-        } else if (is<Element>(*node)) {
-            // Element
-            // If parent has an element child, child is a doctype, or child is non-null and a doctype is following child.
-            if (has_child_of_type<Element>() || is<DocumentType>(child.ptr()) || (child && child->has_following_node_of_type_in_tree_order<DocumentType>()))
-                return WebIDL::HierarchyRequestError::create(realm, "Invalid node type for insertion"_utf16);
-        } else if (is<DocumentType>(*node)) {
-            // DocumentType
-            // parent has a doctype child, child is non-null and an element is preceding child, or child is null and parent has an element child.
-            if (has_child_of_type<DocumentType>() || (child && child->has_preceding_node_of_type_in_tree_order<Element>()) || (!child && has_child_of_type<Element>()))
-                return WebIDL::HierarchyRequestError::create(realm, "Invalid node type for insertion"_utf16);
+    auto children_to_exclude_contains = [&](Node const& candidate) {
+        switch (children_to_exclude) {
+        case ChildrenToExclude::None:
+            return false;
+        case ChildrenToExclude::Child:
+            return child.ptr() == &candidate;
+        case ChildrenToExclude::AllChildren:
+            return candidate.parent() == this;
         }
+        VERIFY_NOT_REACHED();
+    };
+
+    auto has_element_child_not_excluded = [&] {
+        bool has_element_child = false;
+        for_each_child([&](auto const& child) {
+            if (is<Element>(child) && !children_to_exclude_contains(child)) {
+                has_element_child = true;
+                return IterationDecision::Break;
+            }
+            return IterationDecision::Continue;
+        });
+        return has_element_child;
+    };
+
+    auto has_doctype_child_not_excluded = [&] {
+        bool has_doctype_child = false;
+        for_each_child([&](auto const& child) {
+            if (is<DocumentType>(child) && !children_to_exclude_contains(child)) {
+                has_doctype_child = true;
+                return IterationDecision::Break;
+            }
+            return IterationDecision::Continue;
+        });
+        return has_doctype_child;
+    };
+
+    // 5. If parent is not a document:
+    if (!is<Document>(*this)) {
+        // 1. If node is a doctype, then throw a "HierarchyRequestError" DOMException.
+        if (is<DocumentType>(*node))
+            return WebIDL::HierarchyRequestError::create(realm, "Invalid node type for insertion"_utf16);
+
+        // 2. Return.
+        return {};
+    }
+
+    // 6. If node is a Text node, then throw a "HierarchyRequestError" DOMException.
+    if (is<Text>(*node))
+        return WebIDL::HierarchyRequestError::create(realm, "Invalid node type for insertion"_utf16);
+
+    // 7. If node is a CharacterData node, then return.
+    if (is<CharacterData>(*node))
+        return {};
+
+    // 8. If node is a DocumentFragment node:
+    if (auto const* document_fragment = as_if<DocumentFragment>(*node)) {
+        // 1. If node has more than one element child or has a Text node child, then throw a "HierarchyRequestError" DOMException.
+        auto node_element_child_count = document_fragment->child_element_count();
+        if (node_element_child_count > 1 || node->has_child_of_type<Text>())
+            return WebIDL::HierarchyRequestError::create(realm, "Invalid node type for insertion"_utf16);
+
+        // 2. If node has no element child, then return.
+        if (node_element_child_count == 0)
+            return {};
+    }
+
+    // 9. If node is a DocumentFragment or Element node:
+    if (is<DocumentFragment>(*node) || is<Element>(*node)) {
+        // 1. If any of the following are true:
+        //   * parent has an element child that childrenToExclude does not contain;
+        //   * child is non-null and a doctype is following child; or
+        //   * child is a doctype that childrenToExclude does not contain,
+        // then throw a "HierarchyRequestError" DOMException.
+        if (has_element_child_not_excluded()
+            || (child && child->has_following_node_of_type_in_tree_order<DocumentType>())
+            || (is<DocumentType>(child.ptr()) && !children_to_exclude_contains(*child))) {
+            return WebIDL::HierarchyRequestError::create(realm, "Invalid node type for insertion"_utf16);
+        }
+
+        // 2. Return.
+        return {};
+    }
+
+    // 10. Assert: node is a doctype.
+    VERIFY(is<DocumentType>(*node));
+
+    // 11. If any of the following are true:
+    //   * parent has a doctype child that childrenToExclude does not contain;
+    //   * child is non-null and an element is preceding child; or
+    //   * child is null and parent has an element child that childrenToExclude does not contain,
+    // then throw a "HierarchyRequestError" DOMException.
+    if (has_doctype_child_not_excluded()
+        || (child && child->has_preceding_node_of_type_in_tree_order<Element>())
+        || (!child && has_element_child_not_excluded())) {
+        return WebIDL::HierarchyRequestError::create(realm, "Invalid node type for insertion"_utf16);
     }
 
     return {};
@@ -771,8 +842,8 @@ void Node::insert_before(GC::Ref<Node> node, GC::Ptr<Node> child, bool suppress_
 // https://dom.spec.whatwg.org/#concept-node-pre-insert
 WebIDL::ExceptionOr<GC::Ref<Node>> Node::pre_insert(GC::Ref<Node> node, GC::Ptr<Node> child)
 {
-    // 1. Ensure pre-insertion validity of node into parent before child.
-    TRY(ensure_pre_insertion_validity(realm(), node, child));
+    // 1. Ensure pre-insert validity given node, parent, child, and « ».
+    TRY(ensure_pre_insert_validity(realm(), node, child, ChildrenToExclude::None));
 
     // 2. Let referenceChild be child.
     auto reference_child = child;
@@ -998,52 +1069,8 @@ void Node::remove(bool suppress_observers)
 // https://dom.spec.whatwg.org/#concept-node-replace
 WebIDL::ExceptionOr<GC::Ref<Node>> Node::replace_child(GC::Ref<Node> node, GC::Ref<Node> child)
 {
-    // 1. If parent is not a Document, DocumentFragment, or Element node, then throw a "HierarchyRequestError"
-    //    DOMException.
-    if (!is<Document>(this) && !is<DocumentFragment>(this) && !is<Element>(this))
-        return WebIDL::HierarchyRequestError::create(realm(), "Can only insert into a document, document fragment or element"_utf16);
-
-    // 2. If node is a host-including inclusive ancestor of parent, then throw a "HierarchyRequestError" DOMException.
-    if (node->is_host_including_inclusive_ancestor_of(*this))
-        return WebIDL::HierarchyRequestError::create(realm(), "New node is an ancestor of this node"_utf16);
-
-    // 3. If child’s parent is not parent, then throw a "NotFoundError" DOMException.
-    if (child->parent() != this)
-        return WebIDL::NotFoundError::create(realm(), "This node is not the parent of the given child"_utf16);
-
-    // FIXME: All the following "Invalid node type for insertion" messages could be more descriptive.
-
-    // 4. If node is not a DocumentFragment, DocumentType, Element, or CharacterData node, then throw a "HierarchyRequestError" DOMException.
-    if (!is<DocumentFragment>(*node) && !is<DocumentType>(*node) && !is<Element>(*node) && !is<Text>(*node) && !is<Comment>(*node) && !is<ProcessingInstruction>(*node))
-        return WebIDL::HierarchyRequestError::create(realm(), "Invalid node type for insertion"_utf16);
-
-    // 5. If either node is a Text node and parent is a document, or node is a doctype and parent is not a document, then throw a "HierarchyRequestError" DOMException.
-    if ((is<Text>(*node) && is<Document>(this)) || (is<DocumentType>(*node) && !is<Document>(this)))
-        return WebIDL::HierarchyRequestError::create(realm(), "Invalid node type for insertion"_utf16);
-
-    // If parent is a document, and any of the statements below, switched on the interface node implements, are true, then throw a "HierarchyRequestError" DOMException.
-    if (is<Document>(this)) {
-        // DocumentFragment
-        if (is<DocumentFragment>(*node)) {
-            // If node has more than one element child or has a Text node child.
-            // Otherwise, if node has one element child and either parent has an element child that is not child or a doctype is following child.
-            auto node_element_child_count = as<DocumentFragment>(*node).child_element_count();
-            if ((node_element_child_count > 1 || node->has_child_of_type<Text>())
-                || (node_element_child_count == 1 && (first_child_of_type<Element>() != child || child->has_following_node_of_type_in_tree_order<DocumentType>()))) {
-                return WebIDL::HierarchyRequestError::create(realm(), "Invalid node type for insertion"_utf16);
-            }
-        } else if (is<Element>(*node)) {
-            // Element
-            // parent has an element child that is not child or a doctype is following child.
-            if (first_child_of_type<Element>() != child || child->has_following_node_of_type_in_tree_order<DocumentType>())
-                return WebIDL::HierarchyRequestError::create(realm(), "Invalid node type for insertion"_utf16);
-        } else if (is<DocumentType>(*node)) {
-            // DocumentType
-            // parent has a doctype child that is not child, or an element is preceding child.
-            if (first_child_of_type<DocumentType>() != child || child->has_preceding_node_of_type_in_tree_order<Element>())
-                return WebIDL::HierarchyRequestError::create(realm(), "Invalid node type for insertion"_utf16);
-        }
-    }
+    // 1. Ensure pre-insert validity given node, parent, child, and « child ».
+    TRY(ensure_pre_insert_validity(realm(), node, child, ChildrenToExclude::Child));
 
     // 7. Let referenceChild be child’s next sibling.
     GC::Ptr<Node> reference_child = child->next_sibling();
@@ -1297,7 +1324,9 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
     if (is_same_parent_move)
         CSS::Invalidation::invalidate_style_after_same_parent_move(*this, StyleInvalidationReason::NodeInsertBefore);
     else
-        invalidate_style(StyleInvalidationReason::NodeInsertBefore);
+        // NB: Unlike a regular insertion, a moved node keeps state such as focus, so use a distinct reason that
+        //     keeps the conservative pseudo-class handling in :has() invalidation.
+        invalidate_style(StyleInvalidationReason::NodeMove);
     if (is_connected()) {
         new_parent.set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBefore);
     }
@@ -2087,7 +2116,7 @@ IterationDecision Node::serialize_child_as_json(JsonArraySerializer<StringBuilde
 
 void Node::serialize_tree_as_json(JsonObjectSerializer<StringBuilder>& object) const
 {
-    MUST(object.add("name"sv, node_name()));
+    MUST(object.add("name"sv, node_name().view().to_utf8_but_should_be_ported_to_utf16()));
     MUST(object.add("id"sv, unique_id().value()));
     if (is_document()) {
         MUST(object.add("type"sv, "document"));
@@ -2096,12 +2125,12 @@ void Node::serialize_tree_as_json(JsonObjectSerializer<StringBuilder>& object) c
 
         auto const* element = static_cast<DOM::Element const*>(this);
         if (element->namespace_uri().has_value())
-            MUST(object.add("namespace"sv, element->namespace_uri().value()));
+            MUST(object.add("namespace"sv, element->namespace_uri()->view().to_utf8_but_should_be_ported_to_utf16()));
 
         if (element->has_attributes()) {
             auto attributes = MUST(object.add_object("attributes"sv));
-            element->for_each_attribute([&attributes](auto& name, auto& value) {
-                MUST(attributes.add(name, value));
+            element->for_each_attribute([&attributes](Utf16FlyString const& name, Utf16String const& value) {
+                MUST(attributes.add(name.view().to_utf8_but_should_be_ported_to_utf16(), value.to_utf8()));
             });
             MUST(attributes.finish());
         }
@@ -2280,21 +2309,16 @@ WebIDL::ExceptionOr<Utf16String> Node::serialize_fragment(HTML::RequireWellForme
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#unsafely-set-html
-WebIDL::ExceptionOr<void> Node::unsafely_set_html(Element& context_element, StringView html)
+WebIDL::ExceptionOr<void> Node::unsafely_set_html(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> target, Utf16View html)
 {
-    // 1. Let newChildren be the result of the HTML fragment parsing algorithm given contextElement, html, and true.
-    auto new_children = TRY(HTML::HTMLParser::parse_html_fragment(context_element, html, HTML::HTMLParser::AllowDeclarativeShadowRoots::Yes));
+    // FIXME: Update for sanitizer API.
+    // 7. Let fragment be the result of invoking the HTML fragment parsing algorithm given target, html, true, and scriptingMode.
+    auto fragment = TRY(HTML::HTMLParser::parse_html_fragment(target, html, HTML::HTMLParser::AllowDeclarativeShadowRoots::Yes));
 
-    // 2. Let fragment be a new DocumentFragment whose node document is contextElement’s node document.
-    auto fragment = realm().create<DocumentFragment>(context_element.document());
-
-    // 3. For each node in newChildren, append node to fragment.
-    for (auto& child : new_children)
-        // I don't know if this can throw here, but let's be safe.
-        (void)TRY(fragment->append_child(*child));
-
-    // 4. Replace all with fragment within contextElement.
-    replace_all(fragment);
+    // 9. Replace all with fragment within target.
+    target.visit([&](auto node) {
+        node->replace_all(fragment);
+    });
 
     return {};
 }
@@ -2408,24 +2432,24 @@ bool Node::is_equal_node(Node const* other_node) const
     return true;
 }
 
-Vector<FlyString> Node::get_in_scope_prefixes() const
+Vector<Utf16FlyString> Node::get_in_scope_prefixes() const
 {
     // https://html.spec.whatwg.org/multipage/xhtml.html#parsing-xhtml-fragments
     // "A namespace prefix is in scope if the DOM lookupNamespaceURI() method on the element would return a non-null value for that prefix."
 
-    Vector<FlyString> prefixes;
-    HashTable<FlyString> seen_prefixes;
+    Vector<Utf16FlyString> prefixes;
+    HashTable<Utf16FlyString> seen_prefixes;
 
-    auto add_prefix = [&](FlyString const& prefix) {
+    auto add_prefix = [&](Utf16FlyString const& prefix) {
         if (!seen_prefixes.contains(prefix)) {
             prefixes.append(prefix);
             seen_prefixes.set(prefix);
-            VERIFY(lookup_namespace_uri(prefix.to_string()).has_value());
+            VERIFY(lookup_namespace_uri(prefix.to_utf16_string()).has_value());
         }
     };
 
-    add_prefix("xml"_fly_string);
-    add_prefix("xmlns"_fly_string);
+    add_prefix("xml"_utf16_fly_string);
+    add_prefix("xmlns"_utf16_fly_string);
 
     Element const* current = nullptr;
 
@@ -2441,8 +2465,10 @@ Vector<FlyString> Node::get_in_scope_prefixes() const
 
     while (current) {
         if (current->namespace_uri().has_value()) {
-            auto prefix = current->prefix().value_or(""_fly_string);
-            add_prefix(prefix);
+            auto prefix = current->prefix().has_value()
+                ? current->prefix().value()
+                : ""_utf16_fly_string;
+            add_prefix(move(prefix));
         }
 
         if (auto attributes = current->attributes()) {
@@ -2451,11 +2477,11 @@ Vector<FlyString> Node::get_in_scope_prefixes() const
                 if (attr->namespace_uri() != Web::Namespace::XMLNS)
                     continue;
 
-                Optional<FlyString> declared_prefix;
+                Optional<Utf16FlyString> declared_prefix;
 
-                if (!attr->prefix().has_value() && attr->local_name() == "xmlns"_fly_string) {
-                    declared_prefix = ""_fly_string;
-                } else if (attr->prefix() == "xmlns"_fly_string) {
+                if (!attr->prefix().has_value() && attr->local_name() == "xmlns"sv) {
+                    declared_prefix = ""_utf16_fly_string;
+                } else if (attr->prefix() == "xmlns"sv) {
                     declared_prefix = attr->local_name();
                 } else {
                     continue;
@@ -2474,24 +2500,26 @@ Vector<FlyString> Node::get_in_scope_prefixes() const
 }
 
 // https://dom.spec.whatwg.org/#locate-a-namespace
-Optional<String> Node::locate_a_namespace(Optional<String> const& prefix) const
+Optional<Utf16String> Node::locate_a_namespace(Optional<Utf16String> const& prefix) const
 {
     // To locate a namespace for a node using prefix, switch on the interface node implements:
 
     // Element
     if (is<Element>(*this)) {
         // 1. If prefix is "xml", then return the XML namespace.
-        if (prefix == "xml")
-            return Web::Namespace::XML.to_string();
+        if (prefix.has_value() && prefix->utf16_view() == "xml"sv)
+            return Web::Namespace::XML.to_utf16_string();
 
         // 2. If prefix is "xmlns", then return the XMLNS namespace.
-        if (prefix == "xmlns")
-            return Web::Namespace::XMLNS.to_string();
+        if (prefix.has_value() && prefix->utf16_view() == "xmlns"sv)
+            return Web::Namespace::XMLNS.to_utf16_string();
 
         // 3. If its namespace is non-null and its namespace prefix is prefix, then return namespace.
         auto& element = as<Element>(*this);
-        if (element.namespace_uri().has_value() && element.prefix() == prefix)
-            return element.namespace_uri()->to_string();
+        if (element.namespace_uri().has_value()
+            && element.prefix().has_value() == prefix.has_value()
+            && (!prefix.has_value() || element.prefix()->view() == prefix->utf16_view()))
+            return element.namespace_uri()->to_utf16_string();
 
         // 4. If it has an attribute whose namespace is the XMLNS namespace, namespace prefix is "xmlns", and local name is prefix,
         //    or if prefix is null and it has an attribute whose namespace is the XMLNS namespace, namespace prefix is null,
@@ -2500,7 +2528,7 @@ Optional<String> Node::locate_a_namespace(Optional<String> const& prefix) const
             for (size_t i = 0; i < attributes->length(); ++i) {
                 auto& attr = *attributes->item(i);
                 if (attr.namespace_uri() == Web::Namespace::XMLNS) {
-                    if ((attr.prefix() == "xmlns" && attr.local_name() == prefix) || (!prefix.has_value() && !attr.prefix().has_value() && attr.local_name() == "xmlns")) {
+                    if ((attr.prefix() == "xmlns"sv && prefix.has_value() && attr.local_name().view() == prefix->utf16_view()) || (!prefix.has_value() && !attr.prefix().has_value() && attr.local_name() == "xmlns"sv)) {
                         auto value = attr.value();
                         if (!value.is_empty())
                             return value;
@@ -2560,7 +2588,7 @@ Optional<String> Node::locate_a_namespace(Optional<String> const& prefix) const
 }
 
 // https://dom.spec.whatwg.org/#dom-node-lookupnamespaceuri
-Optional<String> Node::lookup_namespace_uri(Optional<String> prefix) const
+Optional<Utf16String> Node::lookup_namespace_uri(Optional<Utf16String> prefix) const
 {
     // 1. If prefix is the empty string, then set it to null.
     if (prefix.has_value() && prefix->is_empty())
@@ -2571,7 +2599,7 @@ Optional<String> Node::lookup_namespace_uri(Optional<String> prefix) const
 }
 
 // https://dom.spec.whatwg.org/#dom-node-lookupprefix
-Optional<String> Node::lookup_prefix(Optional<String> namespace_) const
+Optional<Utf16String> Node::lookup_prefix(Optional<Utf16String> namespace_) const
 {
     // 1. If namespace is null or the empty string, then return null.
     if (!namespace_.has_value() || namespace_->is_empty())
@@ -2622,7 +2650,7 @@ Optional<String> Node::lookup_prefix(Optional<String> namespace_) const
 }
 
 // https://dom.spec.whatwg.org/#dom-node-isdefaultnamespace
-bool Node::is_default_namespace(Optional<String> namespace_) const
+bool Node::is_default_namespace(Optional<Utf16String> namespace_) const
 {
     // 1. If namespace is the empty string, then set it to null.
     if (namespace_.has_value() && namespace_->is_empty())
@@ -2782,7 +2810,7 @@ RefPtr<Painting::Paintable> Node::unsafe_paintable_box()
 }
 
 // https://dom.spec.whatwg.org/#queue-a-mutation-record
-void Node::queue_mutation_record(FlyString const& type, Optional<FlyString> const& attribute_name, Optional<FlyString> const& attribute_namespace, Optional<String> const& old_value, Vector<GC::Root<Node>> added_nodes, Vector<GC::Root<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling)
+void Node::queue_mutation_record(FlyString const& type, Optional<Utf16FlyString> const& attribute_name, Optional<Utf16FlyString> const& attribute_namespace, Optional<Utf16String> const& old_value, Vector<GC::Root<Node>> added_nodes, Vector<GC::Root<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling)
 {
     auto& document = this->document();
     auto& page = document.page();
@@ -2793,7 +2821,7 @@ void Node::queue_mutation_record(FlyString const& type, Optional<FlyString> cons
 
     // 1. Let interestedObservers be an empty map.
     // mutationObserver -> mappedOldValue
-    OrderedHashMap<MutationObserver*, Optional<String>> interested_observers;
+    OrderedHashMap<MutationObserver*, Optional<Utf16String>> interested_observers;
 
     // 2. Let nodes be the inclusive ancestors of target.
     // 3. For each node of nodes, and then for each registered of node’s registered observer list:
@@ -2813,7 +2841,7 @@ void Node::queue_mutation_record(FlyString const& type, Optional<FlyString> cons
             //    then:
             if (!(node != this && !options.subtree)
                 && !(type == MutationType::attributes && (!options.attributes.has_value() || !options.attributes.value()))
-                && !(type == MutationType::attributes && options.attribute_filter.has_value() && (attribute_namespace.has_value() || !options.attribute_filter->contains_slow(attribute_name.value_or(String {}))))
+                && !(type == MutationType::attributes && options.attribute_filter.has_value() && (attribute_namespace.has_value() || !attribute_name.has_value() || !options.attribute_filter->contains_slow(attribute_name.value())))
                 && !(type == MutationType::characterData && (!options.character_data.has_value() || !options.character_data.value()))
                 && !(type == MutationType::childList && !options.child_list)) {
                 // 1. Let mo be registered’s observer.
@@ -2834,14 +2862,6 @@ void Node::queue_mutation_record(FlyString const& type, Optional<FlyString> cons
     if (interested_observers.is_empty() && !page.listen_for_dom_mutations())
         return;
 
-    // FIXME: The MutationRecord constructor should take an Optional<FlyString> attribute name and namespace
-    Optional<String> string_attribute_name;
-    if (attribute_name.has_value())
-        string_attribute_name = attribute_name->to_string();
-    Optional<String> string_attribute_namespace;
-    if (attribute_namespace.has_value())
-        string_attribute_namespace = attribute_namespace->to_string();
-
     auto added_nodes_list = StaticNodeList::create(realm(), move(added_nodes));
     auto removed_nodes_list = StaticNodeList::create(realm(), move(removed_nodes));
 
@@ -2849,7 +2869,7 @@ void Node::queue_mutation_record(FlyString const& type, Optional<FlyString> cons
     for (auto& [observer, mapped_old_value] : interested_observers) {
         // 1. Let record be a new MutationRecord object with its type set to type, target set to target, attributeName set to name, attributeNamespace set to namespace, oldValue set to mappedOldValue,
         //    addedNodes set to addedNodes, removedNodes set to removedNodes, previousSibling set to previousSibling, and nextSibling set to nextSibling.
-        auto record = MutationRecord::create(realm(), type, *this, added_nodes_list, removed_nodes_list, previous_sibling, next_sibling, string_attribute_name, string_attribute_namespace, mapped_old_value);
+        auto record = MutationRecord::create(realm(), type, *this, added_nodes_list, removed_nodes_list, previous_sibling, next_sibling, attribute_name, attribute_namespace, mapped_old_value);
 
         // 2. Enqueue record to observer’s record queue.
         observer->enqueue_record({}, move(record));
@@ -2863,7 +2883,7 @@ void Node::queue_mutation_record(FlyString const& type, Optional<FlyString> cons
 
     // AD-HOC: Notify the UI if it is interested in DOM mutations (i.e. for DevTools).
     if (page.listen_for_dom_mutations())
-        page.client().page_did_mutate_dom(type, *this, added_nodes_list, removed_nodes_list, previous_sibling, next_sibling, string_attribute_name);
+        page.client().page_did_mutate_dom(type, *this, added_nodes_list, removed_nodes_list, previous_sibling, next_sibling, attribute_name);
 }
 
 // https://dom.spec.whatwg.org/#queue-a-tree-mutation-record
@@ -2947,14 +2967,27 @@ void Node::build_accessibility_tree(AccessibilityTreeNode& parent)
 }
 
 // https://www.w3.org/TR/accname-1.2/#mapping_additional_nd_te
-ErrorOr<String> Node::name_or_description(NameOrDescription target, Document const& document, HashTable<UniqueNodeID>& visited_nodes, IsDescendant is_descendant, ShouldComputeRole should_compute_role) const
+static void for_each_ascii_whitespace_separated_token(Utf16View input, Function<IterationDecision(Utf16View)> const& callback)
+{
+    size_t start = 0;
+    for (size_t i = 0; i <= input.length_in_code_units(); ++i) {
+        if (i != input.length_in_code_units() && !Infra::is_ascii_whitespace(input.code_unit_at(i)))
+            continue;
+
+        if (i > start && callback(input.substring_view(start, i - start)) == IterationDecision::Break)
+            return;
+        start = i + 1;
+    }
+}
+
+ErrorOr<Utf16String> Node::name_or_description(NameOrDescription target, Document const& document, HashTable<UniqueNodeID>& visited_nodes, IsDescendant is_descendant, ShouldComputeRole should_compute_role) const
 {
     // The text alternative for a given element is computed as follows:
     // 1. Set the root node to the given element, the current node to the root node, and the total accumulated text to the
     //    empty string (""). If the root node's role prohibits naming, return the empty string ("").
     auto const* root_node = this;
     auto const* current_node = root_node;
-    StringBuilder total_accumulated_text;
+    Utf16StringBuilder total_accumulated_text;
     visited_nodes.set(unique_id());
 
     if (is_element()) {
@@ -3014,24 +3047,30 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
             // i. Set the accumulated text to the empty string.
             total_accumulated_text.clear();
 
-            Vector<StringView> id_list;
+            Vector<Utf16View> id_list;
             if (target == NameOrDescription::Name) {
-                id_list = aria_labelled_by->bytes_as_string_view().split_view_if(Infra::is_ascii_whitespace);
+                for_each_ascii_whitespace_separated_token(aria_labelled_by->utf16_view(), [&](auto id) {
+                    id_list.append(id);
+                    return IterationDecision::Continue;
+                });
             } else {
-                id_list = aria_described_by->bytes_as_string_view().split_view_if(Infra::is_ascii_whitespace);
+                for_each_ascii_whitespace_separated_token(aria_described_by->utf16_view(), [&](auto id) {
+                    id_list.append(id);
+                    return IterationDecision::Continue;
+                });
             }
 
             // ii. For each IDREF:
             for (auto const& id_ref : id_list) {
-                auto node = document.get_element_by_id(MUST(FlyString::from_utf8(id_ref)));
+                auto node = document.get_element_by_id(id_ref);
                 if (!node)
                     continue;
                 // AD-HOC: The “For each IDREF” substep in the spec doesn’t seem to explicitly require the following
                 // check for an aria-label value; but the “div group explicitly labelledby self and heading” subtest at
                 // https://wpt.fyi/results/accname/name/comp_labelledby.html won’t pass unless we do this check.
                 // https://github.com/w3c/aria/issues/2388
-                if (target == NameOrDescription::Name && node->aria_label().has_value() && !node->aria_label()->is_empty() && !node->aria_label()->bytes_as_string_view().is_whitespace()) {
-                    total_accumulated_text.append(' ');
+                if (target == NameOrDescription::Name && node->aria_label().has_value() && !node->aria_label()->is_empty() && !node->aria_label()->is_ascii_whitespace()) {
+                    total_accumulated_text.append_ascii(' ');
                     total_accumulated_text.append(node->aria_label().value());
                 }
                 if (visited_nodes.contains(node->unique_id()))
@@ -3042,7 +3081,7 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
                 // b. Compute the text alternative of the current node beginning with step 2. Set the result to that text alternative.
                 auto result = TRY(node->name_or_description(target, document, visited_nodes));
                 // c. Append the result, with a space, to the accumulated text.
-                total_accumulated_text.append(' ');
+                total_accumulated_text.append_ascii(' ');
                 total_accumulated_text.append(result);
             }
 
@@ -3052,7 +3091,7 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
             // falls back to aria-label” subtest at https://wpt.fyi/results/accname/name/comp_labelledby.html won’t pass
             // unless we do this check.
             // https://github.com/w3c/aria/issues/2388
-            if (total_accumulated_text.string_view().is_whitespace() && target == NameOrDescription::Name && element->aria_label().has_value() && !element->aria_label()->is_empty() && !element->aria_label()->bytes_as_string_view().is_whitespace())
+            if (total_accumulated_text.view().is_ascii_whitespace() && target == NameOrDescription::Name && element->aria_label().has_value() && !element->aria_label()->is_empty() && !element->aria_label()->is_ascii_whitespace())
                 return element->aria_label().release_value();
             return total_accumulated_text.to_string();
         }
@@ -3065,7 +3104,7 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
         // necessitate doing so, and the “input with label for association is superceded by aria-label” subtest at
         // https://wpt.fyi/results/accname/name/comp_label.html won’t pass unless we do this reordering.
         // Spec PR: https://github.com/w3c/aria/pull/2377
-        if (target == NameOrDescription::Name && element->aria_label().has_value() && !element->aria_label()->is_empty() && !element->aria_label()->bytes_as_string_view().is_whitespace()) {
+        if (target == NameOrDescription::Name && element->aria_label().has_value() && !element->aria_label()->is_empty() && !element->aria_label()->is_ascii_whitespace()) {
             // TODO: - If traversal of the current node is due to recursion and the current node is an embedded control as defined in step 2E, ignore aria-label and skip to rule 2E.
             // https://github.com/w3c/aria/pull/2385 and https://github.com/w3c/accname/issues/173
             if (!element->is_html_slot_element())
@@ -3079,10 +3118,10 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
         if (is<HTML::HTMLElement>(this))
             labels = (const_cast<HTML::HTMLElement&>(static_cast<HTML::HTMLElement const&>(*current_node))).labels();
         if (labels != nullptr && labels->length() > 0) {
-            StringBuilder builder;
+            Utf16StringBuilder builder;
             for (u32 i = 0; i < labels->length(); i++) {
                 if (!builder.is_empty())
-                    builder.append(" "sv);
+                    builder.append_ascii(" "sv);
                 auto nodes = labels->item(i)->children_as_vector();
                 for (auto const& node : nodes) {
                     // AD-HOC: https://wpt.fyi/results/accname/name/comp_host_language_label.html has “encapsulation”
@@ -3132,7 +3171,8 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
                                 if (child->is_element()) {
                                     auto const& element = static_cast<DOM::Element const&>(*child);
                                     auto role = element.role_or_default();
-                                    if (role == ARIA::Role::option && element.aria_selected() == "true")
+                                    auto aria_selected = element.aria_selected();
+                                    if (role == ARIA::Role::option && aria_selected.has_value() && aria_selected->utf16_view() == u"true"sv)
                                         builder.append(element.text_content().value());
                                 }
                             }
@@ -3176,12 +3216,12 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
             return element->get_attribute(HTML::AttributeNames::alt).value();
 
         // https://w3c.github.io/svg-aam/#mapping_additional_nd
-        Optional<String> title_element_text;
+        Optional<Utf16String> title_element_text;
         if (element->is_svg_element()) {
             // If the current node has at least one direct child title element, select the appropriate title based on
             // the language rules for the SVG specification, and return the title text alternative as a flat string.
             element->for_each_child_of_type<SVG::SVGTitleElement>([&](SVG::SVGTitleElement const& title) mutable {
-                title_element_text = title.text_content().map([](auto const& title) { return title.to_utf8_but_should_be_ported_to_utf16(); });
+                title_element_text = title.text_content();
                 return IterationDecision::Break;
             });
             if (title_element_text.has_value())
@@ -3198,16 +3238,16 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
         //    then use the subtree of the first such element.
         if (is<HTML::HTMLTableElement>(*element))
             if (auto& table = (const_cast<HTML::HTMLTableElement&>(static_cast<HTML::HTMLTableElement const&>(*element))); table.caption())
-                return table.caption()->text_content()->to_utf8_but_should_be_ported_to_utf16();
+                return table.caption()->text_content().value();
 
         // https://w3c.github.io/html-aam/#fieldset-element-accessible-name-computation
         // 2. If the accessible name is still empty, then: if the fieldset element has a child that is a legend element,
         //    then use the subtree of the first such element.
         if (is<HTML::HTMLFieldSetElement>(*element)) {
-            Optional<String> legend;
+            Optional<Utf16String> legend;
             auto& fieldset = (const_cast<HTML::HTMLFieldSetElement&>(static_cast<HTML::HTMLFieldSetElement const&>(*element)));
             fieldset.for_each_child_of_type<HTML::HTMLLegendElement>([&](HTML::HTMLLegendElement const& element) mutable {
-                legend = element.text_content()->to_utf8_but_should_be_ported_to_utf16();
+                legend = element.text_content().value();
                 return IterationDecision::Break;
             });
             if (legend.has_value())
@@ -3255,11 +3295,11 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
                 auto const& content = before->computed_values().content().value();
 
                 if (content.alt_text.has_value()) {
-                    total_accumulated_text.append(content.alt_text.value());
+                    total_accumulated_text.append(Utf16String::from_utf8(content.alt_text.value()));
                 } else {
                     for (auto const& item : content.data) {
                         if (auto const* string = item.get_pointer<String>())
-                            total_accumulated_text.append(*string);
+                            total_accumulated_text.append(Utf16String::from_utf8(*string));
                     }
                 }
             }
@@ -3306,7 +3346,7 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
                 // J. Append a space character and the result of each step above to the total accumulated text.
                 // AD-HOC: Doing the space-adding here is in a different order from what the spec states.
                 if (should_add_space)
-                    total_accumulated_text.append(' ');
+                    total_accumulated_text.append_ascii(' ');
 
                 // c. Append the result to the accumulated text.
                 total_accumulated_text.append(result);
@@ -3321,11 +3361,11 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
                 auto const& content = after->computed_values().content().value();
 
                 if (content.alt_text.has_value()) {
-                    total_accumulated_text.append(content.alt_text.value());
+                    total_accumulated_text.append(Utf16String::from_utf8(content.alt_text.value()));
                 } else {
                     for (auto& item : content.data) {
                         if (auto const* string = item.get_pointer<String>())
-                            total_accumulated_text.append(*string);
+                            total_accumulated_text.append(Utf16String::from_utf8(*string));
                     }
                 }
             }
@@ -3355,9 +3395,9 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
                 builder.append(slice.text_for_rendering());
             });
             if (!builder.is_empty())
-                return builder.to_string().to_utf8_but_should_be_ported_to_utf16();
+                return builder.to_string();
         }
-        return text_content()->to_utf8_but_should_be_ported_to_utf16();
+        return text_content().value();
     }
 
     // H. Otherwise, if the current node is a descendant of an element whose Accessible Name or Accessible Description
@@ -3388,7 +3428,7 @@ ErrorOr<String> Node::name_or_description(NameOrDescription target, Document con
 }
 
 // https://www.w3.org/TR/accname-1.2/#mapping_additional_nd_name
-ErrorOr<String> Node::accessible_name(Document const& document, ShouldComputeRole should_compute_role) const
+ErrorOr<Utf16String> Node::accessible_name(Document const& document, ShouldComputeRole should_compute_role) const
 {
     HashTable<UniqueNodeID> visited_nodes;
     // User agents MUST compute an accessible name using the rules outlined below in the section titled Accessible Name and Description Computation.
@@ -3396,23 +3436,27 @@ ErrorOr<String> Node::accessible_name(Document const& document, ShouldComputeRol
 }
 
 // https://www.w3.org/TR/accname-1.2/#mapping_additional_nd_description
-ErrorOr<String> Node::accessible_description(Document const& document) const
+ErrorOr<Utf16String> Node::accessible_description(Document const& document) const
 {
     // If aria-describedby is present, user agents MUST compute the accessible description by concatenating the text alternatives for elements referenced by an aria-describedby attribute on the current element.
     // The text alternatives for the referenced elements are computed using a number of methods, outlined below in the section titled Accessible Name and Description Computation.
     if (!is_element())
-        return String {};
+        return Utf16String {};
 
     auto const* element = static_cast<Element const*>(this);
     auto described_by = element->aria_described_by();
     if (!described_by.has_value())
-        return String {};
+        return Utf16String {};
 
     HashTable<UniqueNodeID> visited_nodes;
-    StringBuilder builder;
-    auto id_list = described_by->bytes_as_string_view().split_view_if(Infra::is_ascii_whitespace);
-    for (auto const& id : id_list) {
-        if (auto description_element = document.get_element_by_id(MUST(FlyString::from_utf8(id)))) {
+    Utf16StringBuilder builder;
+    Vector<Utf16View> id_list;
+    for_each_ascii_whitespace_separated_token(described_by->utf16_view(), [&](auto id) {
+        id_list.append(id);
+        return IterationDecision::Continue;
+    });
+    for (auto id : id_list) {
+        if (auto description_element = document.get_element_by_id(id)) {
             auto description = TRY(
                 description_element->name_or_description(NameOrDescription::Description, document,
                     visited_nodes));
@@ -3420,7 +3464,7 @@ ErrorOr<String> Node::accessible_description(Document const& document) const
                 if (builder.is_empty()) {
                     builder.append(description);
                 } else {
-                    builder.append(" "sv);
+                    builder.append_ascii(" "sv);
                     builder.append(description);
                 }
             }
@@ -3429,13 +3473,18 @@ ErrorOr<String> Node::accessible_description(Document const& document) const
     return builder.to_string();
 }
 
-Optional<StringView> Node::first_valid_id(StringView value, Document const& document)
+Optional<Utf16View> Node::first_valid_id(Utf16View value, Document const& document)
 {
-    auto id_list = value.split_view_if(Infra::is_ascii_whitespace);
-    for (auto const& id : id_list) {
-        if (document.get_element_by_id(MUST(FlyString::from_utf8(id))))
-            return id;
-    }
+    Optional<Utf16View> first_id;
+    for_each_ascii_whitespace_separated_token(value, [&](auto id) {
+        if (document.get_element_by_id(id)) {
+            first_id = id;
+            return IterationDecision::Break;
+        }
+        return IterationDecision::Continue;
+    });
+    if (first_id.has_value())
+        return first_id;
     return {};
 }
 

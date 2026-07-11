@@ -12,6 +12,8 @@
 #include <AK/GenericShorthands.h>
 #include <AK/RefPtr.h>
 #include <AK/TypeCasts.h>
+#include <AK/Utf16FlyString.h>
+#include <AK/Utf16View.h>
 #include <AK/Vector.h>
 #include <LibWeb/Bindings/Node.h>
 #include <LibWeb/CSS/InvalidationSet.h>
@@ -158,6 +160,7 @@ public:
     virtual bool is_svg_gradient_element() const { return false; }
     virtual bool is_svg_pattern_element() const { return false; }
     virtual bool is_svg_clip_path_element() const { return false; }
+    virtual bool is_svg_image_element() const { return false; }
     virtual bool is_svg_text_content_element() const { return false; }
 
     bool in_a_document_tree() const;
@@ -202,8 +205,10 @@ public:
     virtual bool is_html_slot_element() const { return false; }
     virtual bool is_html_embed_element() const { return false; }
     virtual bool is_html_object_element() const { return false; }
+    virtual bool is_html_canvas_element() const { return false; }
     virtual bool is_html_form_element() const { return false; }
     virtual bool is_html_image_element() const { return false; }
+    virtual bool is_html_video_element() const { return false; }
     virtual bool is_html_iframe_element() const { return false; }
     virtual bool is_html_div_element() const { return false; }
     virtual bool is_html_span_element() const { return false; }
@@ -256,11 +261,11 @@ public:
     GC::Ref<NodeList> child_nodes();
     Vector<GC::Root<Node>> children_as_vector() const;
 
-    virtual FlyString node_name() const = 0;
+    virtual Utf16FlyString node_name() const = 0;
 
     String base_uri() const;
 
-    virtual Optional<String> alternative_text() const;
+    virtual Optional<Utf16String> alternative_text() const;
 
     Utf16String descendant_text_content() const;
     Optional<Utf16String> text_content() const;
@@ -268,8 +273,8 @@ public:
 
     WebIDL::ExceptionOr<void> normalize();
 
-    Optional<String> node_value() const;
-    WebIDL::ExceptionOr<void> set_node_value(Optional<String> const&);
+    Optional<Utf16String> node_value() const;
+    WebIDL::ExceptionOr<void> set_node_value(Optional<Utf16String> const&);
 
     GC::Ptr<HTML::LocalNavigable> navigable() const;
 
@@ -280,7 +285,7 @@ public:
 
     HTML::HTMLAnchorElement const* enclosing_link_element() const;
     HTML::HTMLElement const* enclosing_html_element() const;
-    HTML::HTMLElement const* enclosing_html_element_with_attribute(FlyString const&) const;
+    HTML::HTMLElement const* enclosing_html_element_with_attribute(Utf16FlyString const&) const;
 
     Utf16String child_text_content() const;
 
@@ -395,7 +400,12 @@ public:
     template<typename T>
     T const* fast_as() const = delete;
 
-    WebIDL::ExceptionOr<void> ensure_pre_insertion_validity(JS::Realm&, GC::Ref<Node> node, GC::Ptr<Node> child) const;
+    enum class ChildrenToExclude : u8 {
+        None,
+        Child,
+        AllChildren,
+    };
+    WebIDL::ExceptionOr<void> ensure_pre_insert_validity(JS::Realm&, GC::Ref<Node> node, GC::Ptr<Node> child, ChildrenToExclude children_to_exclude) const;
 
     bool is_host_including_inclusive_ancestor_of(Node const&) const;
 
@@ -416,7 +426,7 @@ public:
 
     WebIDL::ExceptionOr<Utf16String> serialize_fragment(HTML::RequireWellFormed, FragmentSerializationMode = FragmentSerializationMode::Inner) const;
 
-    WebIDL::ExceptionOr<void> unsafely_set_html(Element&, StringView);
+    WebIDL::ExceptionOr<void> unsafely_set_html(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>>, Utf16View);
 
     void replace_all(GC::Ptr<Node>);
     void string_replace_all(Utf16String);
@@ -437,7 +447,7 @@ public:
 
     void add_registered_observer(RegisteredObserver&);
 
-    void queue_mutation_record(FlyString const& type, Optional<FlyString> const& attribute_name, Optional<FlyString> const& attribute_namespace, Optional<String> const& old_value, Vector<GC::Root<Node>> added_nodes, Vector<GC::Root<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling);
+    void queue_mutation_record(FlyString const& type, Optional<Utf16FlyString> const& attribute_name, Optional<Utf16FlyString> const& attribute_namespace, Optional<Utf16String> const& old_value, Vector<GC::Root<Node>> added_nodes, Vector<GC::Root<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling);
 
     // https://dom.spec.whatwg.org/#concept-shadow-including-inclusive-descendant
     template<typename Callback>
@@ -480,14 +490,14 @@ public:
         return nullptr;
     }
 
-    ErrorOr<String> accessible_name(Document const&, ShouldComputeRole = ShouldComputeRole::Yes) const;
-    ErrorOr<String> accessible_description(Document const&) const;
+    ErrorOr<Utf16String> accessible_name(Document const&, ShouldComputeRole = ShouldComputeRole::Yes) const;
+    ErrorOr<Utf16String> accessible_description(Document const&) const;
 
-    Optional<String> locate_a_namespace(Optional<String> const& prefix) const;
-    Optional<String> lookup_namespace_uri(Optional<String> prefix) const;
-    Optional<String> lookup_prefix(Optional<String> namespace_) const;
-    bool is_default_namespace(Optional<String> namespace_) const;
-    Vector<FlyString> get_in_scope_prefixes() const;
+    Optional<Utf16String> locate_a_namespace(Optional<Utf16String> const& prefix) const;
+    Optional<Utf16String> lookup_namespace_uri(Optional<Utf16String> prefix) const;
+    Optional<Utf16String> lookup_prefix(Optional<Utf16String> namespace_) const;
+    bool is_default_namespace(Optional<Utf16String> namespace_) const;
+    Vector<Utf16FlyString> get_in_scope_prefixes() const;
 
     bool is_inert() const;
 
@@ -533,7 +543,7 @@ protected:
 
     void build_accessibility_tree(AccessibilityTreeNode& parent);
 
-    ErrorOr<String> name_or_description(NameOrDescription, Document const&, HashTable<UniqueNodeID>&, IsDescendant = IsDescendant::No, ShouldComputeRole = ShouldComputeRole::Yes) const;
+    ErrorOr<Utf16String> name_or_description(NameOrDescription, Document const&, HashTable<UniqueNodeID>&, IsDescendant = IsDescendant::No, ShouldComputeRole = ShouldComputeRole::Yes) const;
 
 private:
     void queue_tree_mutation_record(Vector<GC::Root<Node>> added_nodes, Vector<GC::Root<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling);
@@ -545,7 +555,7 @@ private:
     void remove_child_impl(GC::Ref<Node>);
     void clear_layout_node_paintables();
 
-    static Optional<StringView> first_valid_id(StringView, Document const&);
+    static Optional<Utf16View> first_valid_id(Utf16View, Document const&);
 
     GC::Ptr<NodeList> m_child_nodes;
 };

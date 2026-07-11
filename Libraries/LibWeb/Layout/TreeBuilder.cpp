@@ -22,6 +22,8 @@
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
+#include <LibWeb/CSS/StyleValues/ImageSetStyleValue.h>
+#include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/ParentNode.h>
@@ -71,6 +73,30 @@ static bool has_in_flow_block_children(Layout::Node const& layout_node)
             return true;
     }
     return false;
+}
+
+static bool is_out_of_flow_table_internal_child_of_table_root(Layout::NodeWithStyle const& parent, Layout::Node const& child)
+{
+    return parent.display().is_table_inside()
+        && !child.is_anonymous()
+        && child.is_out_of_flow()
+        && !child.has_replaced_element_table_display_adjustment()
+        && child.display_before_box_type_transformation().is_internal_table();
+}
+
+static Optional<CSS::Display> adjusted_table_display_for_replaced_element(CSS::Display display)
+{
+    // https://drafts.csswg.org/css-tables-3/#table-structure
+    // Replaced elements with a table-root display behave as block or inline depending on their
+    // outer display type. Replaced elements with a table-internal display behave as inline.
+    if (display.is_table_inside()) {
+        if (display.is_block_outside())
+            return CSS::Display::from_short(CSS::Display::Short::Block);
+        return CSS::Display::from_short(CSS::Display::Short::Inline);
+    }
+    if (display.is_internal_table() || display.is_table_caption())
+        return CSS::Display::from_short(CSS::Display::Short::Inline);
+    return {};
 }
 
 // The insertion_parent_for_*() functions maintain the invariant that the in-flow children of
@@ -123,6 +149,11 @@ static Layout::Node& insertion_parent_for_block_node(Layout::NodeWithStyle& layo
     if (!has_inline_or_in_flow_block_children(*new_parent))
         return *new_parent;
 
+    // Table-internal boxes may have been blockified before insertion, but table fixup still needs to see them as
+    // direct table children instead of grouping them with neighboring table whitespace.
+    if (is_out_of_flow_table_internal_child_of_table_root(*new_parent, layout_node))
+        return *new_parent;
+
     // If the block is out-of-flow,
     if (layout_node.is_out_of_flow()) {
         // And we're appending while the parent's last child is an anonymous block, join that
@@ -151,6 +182,10 @@ static Layout::Node& insertion_parent_for_block_node(Layout::NodeWithStyle& layo
 
     for (auto child = new_parent->first_child(); child;) {
         auto next_child = child->next_sibling();
+        if (is_out_of_flow_table_internal_child_of_table_root(*new_parent, *child)) {
+            child = next_child;
+            continue;
+        }
         new_parent->remove_child(*child);
         wrapper->append_child(*child);
         child = next_child;
@@ -186,21 +221,17 @@ void TreeBuilder::insert_node_into_inline_or_block_ancestor(Layout::Node& node, 
 }
 
 class GeneratedContentImageProvider final
-    : public ImageProvider
-    , public CSS::ImageStyleValue::Client {
+    : public ImageProvider {
 public:
-    virtual ~GeneratedContentImageProvider() override
-    {
-        unregister_image_style_value_client();
-    }
+    virtual ~GeneratedContentImageProvider() override = default;
 
     virtual void layout_node_was_detached() const override
     {
-        unregister_image_style_value_client();
+        m_image_client = nullptr;
         m_layout_node = nullptr;
     }
 
-    static NonnullOwnPtr<GeneratedContentImageProvider> create(DOM::Document& document, NonnullRefPtr<CSS::ImageStyleValue> image)
+    static NonnullOwnPtr<GeneratedContentImageProvider> create(DOM::Document& document, NonnullRefPtr<CSS::AbstractImageStyleValue> image)
     {
         return adopt_own(*new GeneratedContentImageProvider(document, move(image)));
     }
@@ -212,39 +243,87 @@ public:
 
     virtual GC::Ptr<HTML::DecodedImageData> decoded_image_data() const override
     {
-        if (auto document = this->document())
-            return m_image->image_data(*document);
+        if (auto document = m_document.ptr()) {
+            if (auto const* image = selected_image_style_value())
+                return image->image_data(*document);
+        }
         return nullptr;
     }
 
+    virtual Optional<CSSPixels> intrinsic_width() const override
+    {
+        if (auto document = m_document.ptr())
+            return m_image->natural_width(*document);
+        return {};
+    }
+
+    virtual Optional<CSSPixels> intrinsic_height() const override
+    {
+        if (auto document = m_document.ptr())
+            return m_image->natural_height(*document);
+        return {};
+    }
+
+    virtual Optional<CSSPixelFraction> intrinsic_aspect_ratio() const override
+    {
+        if (auto document = m_document.ptr())
+            return m_image->natural_aspect_ratio(*document);
+        return {};
+    }
+
 private:
-    GeneratedContentImageProvider(DOM::Document& document, NonnullRefPtr<CSS::ImageStyleValue> image)
-        : Client(document, image)
+    class ImageClient final : public CSS::ImageStyleValue::Client {
+    public:
+        ImageClient(GeneratedContentImageProvider const& owner, DOM::Document& document, CSS::ImageStyleValue const& image)
+            : CSS::ImageStyleValue::Client(document, image)
+            , m_owner(owner)
+        {
+        }
+
+        virtual ~ImageClient() override
+        {
+            image_style_value_finalize();
+        }
+
+        virtual void image_style_value_did_update(CSS::ImageStyleValue&) override
+        {
+            if (!m_owner.m_layout_node)
+                return;
+            m_owner.m_layout_node->set_needs_layout_update(DOM::SetNeedsLayoutReason::GeneratedContentImageFinishedLoading);
+        }
+
+    private:
+        GeneratedContentImageProvider const& m_owner;
+    };
+
+    GeneratedContentImageProvider(DOM::Document& document, NonnullRefPtr<CSS::AbstractImageStyleValue> image)
+        : m_document(document)
         , m_image(move(image))
     {
+        if (auto const* image = selected_image_style_value())
+            m_image_client = make<ImageClient>(*this, document, *image);
     }
 
-    virtual void image_style_value_did_update(CSS::ImageStyleValue&) override
+    CSS::ImageStyleValue const* selected_image_style_value() const
     {
-        if (!m_layout_node)
-            return;
-        m_layout_node->set_needs_layout_update(DOM::SetNeedsLayoutReason::GeneratedContentImageFinishedLoading);
+        if (m_image->is_image())
+            return &m_image->as_image();
+
+        if (m_image->is_image_set()) {
+            if (auto const* selected_image = m_image->as_image_set().selected_image(); selected_image && selected_image->is_image())
+                return &selected_image->as_image();
+        }
+
+        return nullptr;
     }
 
-    void unregister_image_style_value_client() const
-    {
-        if (!m_registered_as_image_style_value_client)
-            return;
-        const_cast<GeneratedContentImageProvider&>(*this).image_style_value_finalize();
-        m_registered_as_image_style_value_client = false;
-    }
-
+    GC::Weak<DOM::Document> m_document;
     mutable WeakPtr<Layout::Node> m_layout_node;
-    NonnullRefPtr<CSS::ImageStyleValue> m_image;
-    mutable bool m_registered_as_image_style_value_client { true };
+    NonnullRefPtr<CSS::AbstractImageStyleValue> m_image;
+    mutable OwnPtr<ImageClient> m_image_client;
 };
 
-static NonnullRefPtr<ImageBox> create_content_image_box(DOM::Document& document, GC::Ptr<DOM::Element> element, CSS::ComputedProperties const& style, CSS::ImageStyleValue& image)
+static NonnullRefPtr<ImageBox> create_content_image_box(DOM::Document& document, GC::Ptr<DOM::Element> element, CSS::ComputedProperties const& style, CSS::AbstractImageStyleValue& image)
 {
     image.load_any_resources(document);
     auto image_provider = GeneratedContentImageProvider::create(document, image);
@@ -572,7 +651,7 @@ RefPtr<NodeWithStyle> TreeBuilder::create_pseudo_element_if_needed(DOM::Element&
                 if (auto const* string = item.get_pointer<String>()) {
                     layout_node = make_ref_counted<GeneratedTextNode>(document, Utf16String::from_utf8(*string));
                 } else {
-                    auto& image = *item.get<NonnullRefPtr<CSS::ImageStyleValue>>();
+                    auto& image = *item.get<NonnullRefPtr<CSS::AbstractImageStyleValue>>();
                     layout_node = create_content_image_box(document, nullptr, *pseudo_element_style, image);
                 }
                 layout_node->set_generated_for(pseudo_element, element);
@@ -597,11 +676,11 @@ RefPtr<NodeWithStyle> TreeBuilder::create_content_replacement_if_needed(DOM::Ele
 
     if (content.type != CSS::ContentData::Type::List
         || content.data.size() != 1
-        || !content.data.first().has<NonnullRefPtr<CSS::ImageStyleValue>>()) {
+        || !content.data.first().has<NonnullRefPtr<CSS::AbstractImageStyleValue>>()) {
         return {};
     }
 
-    auto& image = *content.data.first().get<NonnullRefPtr<CSS::ImageStyleValue>>();
+    auto& image = *content.data.first().get<NonnullRefPtr<CSS::AbstractImageStyleValue>>();
     return create_content_image_box(element.document(), element, style, image);
 }
 
@@ -818,6 +897,14 @@ void TreeBuilder::update_layout_tree(DOM::Node& dom_node, TreeBuilder::Context& 
 
     if (!layout_node)
         return;
+
+    if (layout_node->is_replaced_element()) {
+        if (auto adjusted_display = adjusted_table_display_for_replaced_element(display); adjusted_display.has_value()) {
+            display = *adjusted_display;
+            auto& computed_values = as<NodeWithStyle>(*layout_node).mutable_computed_values();
+            computed_values.set_display(display);
+        }
+    }
 
     // Decide whether to replace an existing node (partial tree update) or insert a new one appropriately.
     bool const may_replace_existing_layout_node = must_create_subtree == MustCreateSubtree::No
@@ -1288,6 +1375,45 @@ void TreeBuilder::fixup_tables(NodeWithStyle& root)
     missing_cells_fixup(table_root_boxes);
 }
 
+static bool is_first_or_last_child_with_table_non_root_sibling_if_any(Node const& node)
+{
+    auto is_table_non_root_box = [](Node const& node) {
+        auto const display = node.display();
+        return display.is_table_row()
+            || display.is_table_column()
+            || display.is_table_row_group()
+            || display.is_table_header_group()
+            || display.is_table_footer_group()
+            || display.is_table_column_group()
+            || display.is_table_cell()
+            || display.is_table_caption();
+    };
+
+    auto previous_sibling = node.previous_sibling();
+    auto next_sibling = node.next_sibling();
+    if (previous_sibling && next_sibling)
+        return false;
+
+    if (previous_sibling && !is_table_non_root_box(*previous_sibling))
+        return false;
+
+    if (next_sibling && !is_table_non_root_box(*next_sibling))
+        return false;
+
+    return true;
+}
+
+// https://drafts.csswg.org/css-tables-3/#tabular-container
+static bool is_tabular_container(Node const& node)
+{
+    auto const& display = node.display();
+    return display.is_table_inside()
+        || display.is_table_row()
+        || display.is_table_row_group()
+        || display.is_table_header_group()
+        || display.is_table_footer_group();
+}
+
 // https://drafts.csswg.org/css-tables-3/#fixup-algorithm
 // 1. Remove irrelevant boxes:
 void TreeBuilder::remove_irrelevant_boxes(NodeWithStyle& root)
@@ -1313,12 +1439,27 @@ void TreeBuilder::remove_irrelevant_boxes(NodeWithStyle& root)
         });
     });
 
-    // FIXME:
-    // 3. Anonymous inline boxes which contain only white space and are between two immediate siblings each of which is a table-non-root box.
+    // FIXME: 3. Anonymous inline boxes which contain only white space and are between two immediate siblings each of
+    //           which is a table-non-root box.
+
     // 4. Anonymous inline boxes which meet all of the following criteria:
     //    - they contain only white space
     //    - they are the first and/or last child of a tabular container
     //    - whose immediate sibling, if any, is a table-non-root box
+    root.for_each_in_inclusive_subtree_of_type<Box>([&](auto& box) {
+        auto* parent = box.parent();
+        if (!parent
+            || !is_tabular_container(*parent)
+            || !is_first_or_last_child_with_table_non_root_sibling_if_any(box)) {
+            return TraversalDecision::Continue;
+        }
+
+        if (is_ignorable_whitespace(box)) {
+            to_remove.append(box);
+            return TraversalDecision::SkipChildrenAndContinue;
+        }
+        return TraversalDecision::Continue;
+    });
 
     for (auto& box : to_remove)
         box->parent()->remove_child(*box);
@@ -1339,9 +1480,24 @@ static bool is_table_track_group(CSS::Display display)
         || display.is_table_column_group();
 }
 
+static CSS::Display display_for_table_fixup(Node const& node)
+{
+    // https://drafts.csswg.org/css-tables-3/#fixup-algorithm
+    // For the purposes of these rules, out-of-flow elements are represented as inline elements of zero width and
+    // height. Their containing blocks are chosen accordingly.
+    //
+    // AD-HOC: Table-internal boxes can be blockified before fixup. Use the pre-transformation display for authored
+    // boxes so an out-of-flow table-header-group is still recognized as a proper table child during fixup.
+    if (node.has_replaced_element_table_display_adjustment())
+        return node.display();
+    if (!node.is_anonymous())
+        return node.display_before_box_type_transformation();
+    return node.display();
+}
+
 static bool is_proper_table_child(Node const& node)
 {
-    auto const display = node.display();
+    auto const display = display_for_table_fixup(node);
     return is_table_track_group(display) || is_table_track(display) || display.is_table_caption();
 }
 
@@ -1378,7 +1534,7 @@ static bool is_not_table_cell(Node const& node)
 
 static bool is_table_row_group_column_group_or_caption(Node const& node)
 {
-    auto const display = node.display();
+    auto const display = display_for_table_fixup(node);
     return is_table_track_group(display) || display.is_table_caption();
 }
 

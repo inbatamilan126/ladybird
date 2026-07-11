@@ -100,7 +100,7 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_html_document(HTML::Navi
         && navigation_params.response->body()->length().value_or(0) == 0) {
         TRY(document->populate_with_html_head_and_body());
         if (navigation_params.navigable && navigation_params.navigable->is_top_level_traversable())
-            document->set_supported_color_schemes({ "light"_string, "dark"_string });
+            document->set_supported_color_schemes({ "light"_utf16_fly_string, "dark"_utf16_fly_string });
         HTML::HTMLParser::the_end(document);
     }
 
@@ -126,7 +126,8 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_html_document(HTML::Navi
         }));
     }
 
-    // 3. Otherwise, create an HTML parser and associate it with the document.
+    // 3. Otherwise, create an HTML parser whose allow declarative shadow roots is true and associate it with document.
+    //
     //    Each task that the networking task source places on the task queue while fetching runs must then fill the
     //    parser's input byte stream with the fetched bytes and cause the HTML parser to perform the appropriate
     //    processing of the input stream.
@@ -141,6 +142,7 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_html_document(HTML::Navi
     else {
         auto body = GC::Ref { *navigation_params.response->body() };
         auto parser = HTML::IncrementalDocumentParser::create(document, body, navigation_params.response->url().value(), Fetch::Infrastructure::extract_mime_type(navigation_params.response->header_list()));
+        parser->set_allow_declarative_shadow_roots(HTML::HTMLParser::AllowDeclarativeShadowRoots::Yes);
         parser->start();
     }
 
@@ -354,25 +356,26 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_media_document(HTML::Nav
     TRY(document->head()->append_child(style_element));
 
     auto url_string = document->url_string();
+    auto url_utf16 = Utf16String::from_utf8(url_string);
     if (type.is_image()) {
         auto img_element = TRY(DOM::create_element(document, HTML::TagNames::img, Namespace::HTML));
-        img_element->set_attribute_value(HTML::AttributeNames::src, url_string);
+        img_element->set_attribute_value(HTML::AttributeNames::src, url_utf16);
         TRY(document->body()->append_child(img_element));
         TRY(insert_title(document, url_string));
 
     } else if (type.type() == "video"sv) {
         auto video_element = TRY(DOM::create_element(document, HTML::TagNames::video, Namespace::HTML));
-        video_element->set_attribute_value(HTML::AttributeNames::src, url_string);
-        video_element->set_attribute_value(HTML::AttributeNames::autoplay, String {});
-        video_element->set_attribute_value(HTML::AttributeNames::controls, String {});
+        video_element->set_attribute_value(HTML::AttributeNames::src, url_utf16);
+        video_element->set_attribute_value(HTML::AttributeNames::autoplay, Utf16String {});
+        video_element->set_attribute_value(HTML::AttributeNames::controls, Utf16String {});
         TRY(document->body()->append_child(video_element));
         TRY(insert_title(document, url_string));
 
     } else if (type.type() == "audio"sv) {
         auto audio_element = TRY(DOM::create_element(document, HTML::TagNames::audio, Namespace::HTML));
-        audio_element->set_attribute_value(HTML::AttributeNames::src, url_string);
-        audio_element->set_attribute_value(HTML::AttributeNames::autoplay, String {});
-        audio_element->set_attribute_value(HTML::AttributeNames::controls, String {});
+        audio_element->set_attribute_value(HTML::AttributeNames::src, url_utf16);
+        audio_element->set_attribute_value(HTML::AttributeNames::autoplay, Utf16String {});
+        audio_element->set_attribute_value(HTML::AttributeNames::controls, Utf16String {});
         TRY(document->body()->append_child(audio_element));
         TRY(insert_title(document, url_string));
 

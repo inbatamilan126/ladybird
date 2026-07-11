@@ -59,14 +59,15 @@ void EditingHostManager::select_all()
     MUST(selection->set_base_and_extent(*selection->anchor_node(), 0, *selection->focus_node(), selection->focus_node()->length()));
 }
 
-void EditingHostManager::set_selection_anchor(GC::Ref<DOM::Node> anchor_node, size_t anchor_offset)
+void EditingHostManager::set_selection_anchor(GC::Ref<DOM::Node> anchor_node, size_t anchor_offset, TextAffinity affinity)
 {
     auto selection = m_document->get_selection();
     MUST(selection->collapse(*anchor_node, anchor_offset));
+    selection->set_focus_affinity(affinity);
     m_document->reset_cursor_blink_cycle();
 }
 
-void EditingHostManager::set_selection_focus(GC::Ref<DOM::Node> focus_node, size_t focus_offset)
+void EditingHostManager::set_selection_focus(GC::Ref<DOM::Node> focus_node, size_t focus_offset, TextAffinity affinity)
 {
     if (!m_active_contenteditable_element || !m_active_contenteditable_element->is_ancestor_of(*focus_node))
         return;
@@ -74,6 +75,7 @@ void EditingHostManager::set_selection_focus(GC::Ref<DOM::Node> focus_node, size
     if (!selection->anchor_node())
         return;
     MUST(selection->set_base_and_extent(*selection->anchor_node(), selection->anchor_offset(), *focus_node, focus_offset));
+    selection->set_focus_affinity(affinity);
     m_document->reset_cursor_blink_cycle();
 }
 
@@ -172,7 +174,7 @@ void EditingHostManager::decrement_cursor_position_to_previous_line(CollapseSele
         selection->move_offset_to_previous_line(collapse == CollapseSelection::Yes);
 }
 
-void EditingHostManager::handle_delete(FlyString const& input_type)
+void EditingHostManager::handle_delete(FlyString const& input_type, DispatchInputEvent dispatch_input_event)
 {
     // https://w3c.github.io/editing/docs/execCommand/#additional-requirements
     // When the user instructs the user agent to delete the previous character inside an editing host, such as by
@@ -182,7 +184,7 @@ void EditingHostManager::handle_delete(FlyString const& input_type)
     // the Delete key while the cursor is in an editable node, the user agent must call execCommand("forwarddelete") on
     // the relevant document.
     auto command = input_type == UIEvents::InputTypes::deleteContentBackward ? Editing::CommandNames::delete_ : Editing::CommandNames::forwardDelete;
-    auto editing_result = m_document->exec_command(command, false, {});
+    auto editing_result = m_document->exec_command_internal(command, false, {}, dispatch_input_event == DispatchInputEvent::Yes ? DOM::Document::DispatchInputEvent::Yes : DOM::Document::DispatchInputEvent::No);
     if (editing_result.is_exception())
         dbgln("handle_delete(): editing resulted in exception: {}", editing_result.exception());
 }

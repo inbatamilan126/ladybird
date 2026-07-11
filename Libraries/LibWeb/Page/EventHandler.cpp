@@ -37,6 +37,7 @@
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/Navigator.h>
 #include <LibWeb/HTML/PaintConfig.h>
+#include <LibWeb/Infra/Strings.h>
 #include <LibWeb/Layout/TextOffsetMapping.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/AutoScrollHandler.h>
@@ -68,6 +69,116 @@ namespace Web {
 #define FIRE(expression)                                                          \
     if (auto event_result = (expression); event_result == EventResult::Cancelled) \
         return event_result;
+
+static GC::Ptr<DOM::Node> associated_descendant_editing_host(DOM::Node& node)
+{
+    if (node.is_editing_host())
+        return node;
+    if (node.is_editable()) {
+        auto editing_host = node.editing_host();
+        return editing_host && editing_host->is_editing_host() ? editing_host : nullptr;
+    }
+
+    Optional<CSSPixelRect> hit_node_rect;
+    if (auto paintable = node.paintable())
+        hit_node_rect = paintable->absolute_rect();
+
+    for (auto* ancestor = &node; ancestor; ancestor = ancestor->parent_or_shadow_host()) {
+        GC::Ptr<DOM::Node> editing_host;
+        bool has_multiple_editing_hosts = false;
+        ancestor->for_each_in_subtree([&](GC::Ref<DOM::Node> descendant) {
+            if (!descendant->is_editing_host())
+                return TraversalDecision::Continue;
+            if (editing_host) {
+                has_multiple_editing_hosts = true;
+                return TraversalDecision::Break;
+            }
+            editing_host = descendant;
+            return TraversalDecision::Continue;
+        });
+
+        if (editing_host && !has_multiple_editing_hosts) {
+            if (ancestor == &node)
+                return editing_host;
+            auto editing_host_paintable = editing_host->paintable();
+            if (hit_node_rect.has_value() && editing_host_paintable
+                && hit_node_rect->intersects(editing_host_paintable->absolute_rect()))
+                return editing_host;
+        }
+
+        if (ancestor != &node && ancestor->is_focusable())
+            break;
+    }
+
+    return nullptr;
+}
+
+static GC::Ptr<DOM::Node> first_editable_leaf_descendant(DOM::Node& root)
+{
+    GC::Ptr<DOM::Node> result;
+    root.for_each_in_subtree([&](GC::Ref<DOM::Node> descendant) {
+        if (descendant->is_uninteresting_whitespace_node())
+            return TraversalDecision::Continue;
+        if (!descendant->is_editable())
+            return TraversalDecision::Continue;
+
+        bool has_editable_descendant = false;
+        descendant->for_each_in_subtree([&](GC::Ref<DOM::Node> child) {
+            if (child.ptr() == descendant.ptr())
+                return TraversalDecision::Continue;
+            if (child->is_uninteresting_whitespace_node())
+                return TraversalDecision::Continue;
+            if (!child->is_editable())
+                return TraversalDecision::Continue;
+            has_editable_descendant = true;
+            return TraversalDecision::Break;
+        });
+        if (has_editable_descendant)
+            return TraversalDecision::Continue;
+
+        result = descendant;
+        return TraversalDecision::Break;
+    });
+    return result;
+}
+
+static Optional<Painting::CaretPosition> caret_position_from_editable_hit_node(DOM::Node& hit_node)
+{
+    GC::Ptr<DOM::Node> boundary_node;
+    if (hit_node.is_editable_or_editing_host())
+        boundary_node = hit_node;
+    else if (auto editing_host = associated_descendant_editing_host(hit_node)) {
+        boundary_node = first_editable_leaf_descendant(*editing_host);
+        if (!boundary_node)
+            boundary_node = editing_host;
+    } else {
+        return {};
+    }
+
+    auto paintable = boundary_node->paintable();
+    if (!paintable)
+        paintable = hit_node.paintable();
+    if (!paintable)
+        return {};
+
+    return Painting::CaretPosition {
+        .paintable = *paintable,
+        .boundary = { *boundary_node, 0 },
+    };
+}
+
+static bool should_use_caret_position_from_editable_hit_node(Optional<Painting::CaretPosition> const& caret_position, DOM::Node& hit_node, DOM::Node& editing_host)
+{
+    if (!hit_node.is_inclusive_descendant_of(editing_host))
+        return true;
+    if (!caret_position.has_value())
+        return true;
+    if (!caret_position->boundary.node->is_inclusive_descendant_of(editing_host))
+        return true;
+    if (caret_position->boundary.node.ptr() == &editing_host && first_editable_leaf_descendant(editing_host))
+        return true;
+    return false;
+}
 
 EventHandler::EventHandler(Badge<HTML::LocalNavigable>, HTML::LocalNavigable& navigable)
     : m_navigable(navigable)
@@ -119,7 +230,7 @@ static Optional<EventResult> dispatch_event_to_nested_navigable(Painting::Painta
     if (auto* navigable_paintable = as_if<Painting::NavigableContainerViewportPaintable>(paintable)) {
         auto position = navigable_paintable->transform_to_local_coordinates(viewport_position) - navigable_paintable->absolute_rect().location();
         if (auto content_navigable = as_if<HTML::NavigableContainer>(*node)->content_navigable()) {
-            return dispatch(content_navigable->event_handler(), position);
+            return dispatch(as<HTML::LocalNavigable>(*content_navigable).event_handler(), position);
         }
         return EventResult::Dropped;
     }
@@ -322,6 +433,9 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
 
         if (delta.x().abs() >= DRAG_THRESHOLD || delta.y().abs() >= DRAG_THRESHOLD) {
             auto result = handle_drag_and_drop_event(DragEvent::Type::DragStart, visual_viewport_position, screen_position, UIEvents::MouseButton::Primary, buttons, modifiers, {});
+#if defined(AK_OS_MACOS)
+            bool should_start_selection_from_preserved_mousedown = m_mousedown_preserved_selection && result != EventResult::Handled;
+#endif
 
             if (result == EventResult::Handled) {
                 set_page_cursor(m_navigable->page(), Gfx::StandardCursor::Drag);
@@ -339,6 +453,11 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
             document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseMove);
             if (!paint_root())
                 return EventResult::Accepted;
+
+#if defined(AK_OS_MACOS)
+            if (should_start_selection_from_preserved_mousedown)
+                start_selection_from_preserved_mousedown(*document);
+#endif
         }
     }
 
@@ -905,6 +1024,15 @@ static bool should_ignore_keydown_event(u32 code_point, u32 modifiers, bool shou
     return false;
 }
 
+static Optional<FlyString> input_type_for_delete_key(UIEvents::KeyCode key)
+{
+    if (key == UIEvents::KeyCode::Key_Backspace)
+        return UIEvents::InputTypes::deleteContentBackward;
+    if (key == UIEvents::KeyCode::Key_Delete)
+        return UIEvents::InputTypes::deleteContentForward;
+    return {};
+}
+
 EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u32 code_point, bool repeat, bool should_insert_text)
 {
     if (!m_navigable->active_document())
@@ -915,9 +1043,29 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
     if (should_ignore_device_input_event() && m_mousedown_target_is_drag_candidate && key == UIEvents::KeyCode::Key_Escape)
         return cancel_drag_and_drop_event(m_last_known_mouse_visual_viewport_position.value_or({}), m_last_known_mouse_screen_position, UIEvents::MouseButton::Primary, m_last_known_mouse_buttons, modifiers);
 
+    auto handle_delete_key = [&](InputEventsTarget& target, InputEventsTarget::DispatchInputEvent dispatch_input_event) -> Optional<EventResult> {
+        auto input_type = input_type_for_delete_key(key);
+        if (!input_type.has_value())
+            return {};
+
+        auto beforeinput_result = input_event(UIEvents::EventNames::beforeinput, input_type.value(), m_navigable, code_point);
+        if (beforeinput_result == EventResult::Cancelled)
+            return beforeinput_result;
+
+        target.handle_delete(input_type.value(), dispatch_input_event);
+        return EventResult::Handled;
+    };
+
     auto dispatch_result = fire_keyboard_event(UIEvents::EventNames::keydown, m_navigable, key, modifiers, code_point, repeat);
-    if (dispatch_result != EventResult::Accepted)
+    if (dispatch_result == EventResult::Cancelled) {
+        if (auto document = m_navigable->active_document(); document && document->is_fully_active()) {
+            if (auto* target = document->active_input_events_target()) {
+                if (auto delete_result = handle_delete_key(*target, InputEventsTarget::DispatchInputEvent::No); delete_result.has_value())
+                    return delete_result.value();
+            }
+        }
         return dispatch_result;
+    }
 
     // https://w3c.github.io/uievents/#event-type-keypress
     // If supported by a user agent, this event MUST be dispatched when a key is pressed down, if and only if that key
@@ -968,17 +1116,8 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
     }
 
     if (auto* target = document->active_input_events_target()) {
-        if (key == UIEvents::KeyCode::Key_Backspace) {
-            FIRE(input_event(UIEvents::EventNames::beforeinput, UIEvents::InputTypes::deleteContentBackward, m_navigable, code_point));
-            target->handle_delete(UIEvents::InputTypes::deleteContentBackward);
-            return EventResult::Handled;
-        }
-
-        if (key == UIEvents::KeyCode::Key_Delete) {
-            FIRE(input_event(UIEvents::EventNames::beforeinput, UIEvents::InputTypes::deleteContentForward, m_navigable, code_point));
-            target->handle_delete(UIEvents::InputTypes::deleteContentForward);
-            return EventResult::Handled;
-        }
+        if (auto delete_result = handle_delete_key(*target, InputEventsTarget::DispatchInputEvent::Yes); delete_result.has_value())
+            return delete_result.value();
 
 #if defined(AK_OS_MACOS)
         if ((modifiers & UIEvents::Mod_Super) != 0) {
@@ -1102,12 +1241,13 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
     auto arrow_key_scroll_distance = 100;
     auto page_scroll_distance = document->window()->inner_height() - (document->window()->outer_height() - document->window()->inner_height());
 
+    auto const modifiers_without_keypad = modifiers & ~UIEvents::Mod_Keypad;
     switch (key) {
     case UIEvents::KeyCode::Key_Up:
     case UIEvents::KeyCode::Key_Down:
-        if (modifiers && modifiers != UIEvents::KeyModifier::Mod_PlatformCtrl)
+        if (modifiers_without_keypad && modifiers_without_keypad != UIEvents::KeyModifier::Mod_PlatformCtrl)
             break;
-        if (modifiers) {
+        if (modifiers_without_keypad) {
             if (key == UIEvents::KeyCode::Key_Up)
                 document->scroll_to_the_beginning_of_the_document();
             else
@@ -1119,19 +1259,19 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
     case UIEvents::KeyCode::Key_Left:
     case UIEvents::KeyCode::Key_Right:
 #if defined(AK_OS_MACOS)
-        if (modifiers && modifiers != UIEvents::KeyModifier::Mod_Super)
+        if (modifiers_without_keypad && modifiers_without_keypad != UIEvents::KeyModifier::Mod_Super)
 #else
-        if (modifiers && modifiers != UIEvents::KeyModifier::Mod_Alt)
+        if (modifiers_without_keypad && modifiers_without_keypad != UIEvents::KeyModifier::Mod_Alt)
 #endif
             break;
-        if (modifiers)
+        if (modifiers_without_keypad)
             document->page().traverse_the_history_by_delta(key == UIEvents::KeyCode::Key_Left ? -1 : 1);
         else
             document->window()->scroll_by(key == UIEvents::KeyCode::Key_Left ? -arrow_key_scroll_distance : arrow_key_scroll_distance, 0);
         return EventResult::Handled;
     case UIEvents::KeyCode::Key_PageUp:
     case UIEvents::KeyCode::Key_PageDown:
-        if (modifiers != UIEvents::KeyModifier::Mod_None)
+        if (modifiers_without_keypad != UIEvents::KeyModifier::Mod_None)
             break;
         document->window()->scroll_by(0, key == UIEvents::KeyCode::Key_PageUp ? -page_scroll_distance : page_scroll_distance);
         return EventResult::Handled;
@@ -1269,8 +1409,12 @@ EventResult EventHandler::handle_paste(Utf16String const& text)
     if (!target)
         return EventResult::Dropped;
 
-    FIRE(input_event(UIEvents::EventNames::beforeinput, UIEvents::InputTypes::insertFromPaste, m_navigable, text));
-    target->handle_insert(UIEvents::InputTypes::insertFromPaste, text);
+    // Clipboard text can contain CRLF or lone CR line breaks (e.g. from the system clipboard); normalize them to
+    // newlines like other browsers, so that no raw carriage returns end up in the document.
+    auto normalized_text = Infra::normalize_newlines(text);
+
+    FIRE(input_event(UIEvents::EventNames::beforeinput, UIEvents::InputTypes::insertFromPaste, m_navigable, normalized_text));
+    target->handle_insert(UIEvents::InputTypes::insertFromPaste, normalized_text);
 
     return EventResult::Handled;
 }
@@ -1333,11 +1477,43 @@ void EventHandler::process_auto_scroll()
         m_middle_button_scroll_handler->perform_tick();
 }
 
-static GC::RootVector<GC::Ref<DOM::StaticRange>> target_ranges_for_input_event(DOM::Document const& document)
+static GC::Ptr<DOM::StaticRange> collapsed_delete_target_range_for_input_event(DOM::Document const& document, DOM::Range const& range, FlyString const& input_type)
+{
+    if (!range.start_container()->is_editable_or_editing_host())
+        return nullptr;
+
+    auto* text_node = as_if<DOM::Text>(*range.start_container());
+    if (!text_node)
+        return nullptr;
+
+    auto offset = range.start_offset();
+    if (input_type == UIEvents::InputTypes::deleteContentBackward && offset > 0) {
+        auto start_offset = text_node->grapheme_segmenter().previous_boundary(offset).value_or(offset - 1);
+        return document.realm().create<DOM::StaticRange>(*text_node, start_offset, *text_node, offset);
+    }
+
+    if (input_type == UIEvents::InputTypes::deleteContentForward && offset < text_node->length()) {
+        auto end_offset = text_node->grapheme_segmenter().next_boundary(offset).value_or(offset + 1);
+        return document.realm().create<DOM::StaticRange>(*text_node, offset, *text_node, end_offset);
+    }
+
+    return nullptr;
+}
+
+static GC::RootVector<GC::Ref<DOM::StaticRange>> target_ranges_for_input_event(DOM::Document const& document, FlyString const& input_type)
 {
     GC::RootVector<GC::Ref<DOM::StaticRange>> target_ranges;
-    if (auto selection = document.get_selection(); selection && !selection->is_collapsed()) {
+    if (auto selection = document.get_selection(); selection) {
         if (auto range = selection->range()) {
+            if (selection->is_collapsed()) {
+                if (auto delete_target_range = collapsed_delete_target_range_for_input_event(document, *range, input_type)) {
+                    target_ranges.append(*delete_target_range);
+                    return target_ranges;
+                }
+
+                if (input_type != UIEvents::InputTypes::insertText)
+                    return target_ranges;
+            }
             auto static_range = document.realm().create<DOM::StaticRange>(range->start_container(), range->start_offset(), range->end_container(), range->end_offset());
             target_ranges.append(static_range);
         }
@@ -1357,7 +1533,7 @@ EventResult EventHandler::fire_keyboard_event(FlyString const& event_name, HTML:
         if (is<HTML::NavigableContainer>(*focused_area)) {
             auto& navigable_container = as<HTML::NavigableContainer>(*focused_area);
             if (navigable_container.content_navigable())
-                return fire_keyboard_event(event_name, *navigable_container.content_navigable(), key, modifiers, code_point, repeat);
+                return fire_keyboard_event(event_name, as<HTML::LocalNavigable>(*navigable_container.content_navigable()), key, modifiers, code_point, repeat);
         }
 
         auto event = UIEvents::KeyboardEvent::create_from_platform_event(document->realm(), event_name, key, modifiers, code_point, repeat);
@@ -1396,14 +1572,14 @@ EventResult EventHandler::input_event(FlyString const& event_name, FlyString con
         if (is<HTML::NavigableContainer>(*focused_area)) {
             auto& navigable_container = as<HTML::NavigableContainer>(*focused_area);
             if (navigable_container.content_navigable())
-                return input_event(event_name, input_type, *navigable_container.content_navigable(), move(code_point_or_string));
+                return input_event(event_name, input_type, as<HTML::LocalNavigable>(*navigable_container.content_navigable()), move(code_point_or_string));
         }
 
-        auto event = UIEvents::InputEvent::create_from_platform_event(document->realm(), event_name, input_event_init, target_ranges_for_input_event(*document));
+        auto event = UIEvents::InputEvent::create_from_platform_event(document->realm(), event_name, input_event_init, target_ranges_for_input_event(*document, input_type));
         return focused_area->dispatch_event(event) ? EventResult::Accepted : EventResult::Cancelled;
     }
 
-    auto event = UIEvents::InputEvent::create_from_platform_event(document->realm(), event_name, input_event_init, target_ranges_for_input_event(*document));
+    auto event = UIEvents::InputEvent::create_from_platform_event(document->realm(), event_name, input_event_init, target_ranges_for_input_event(*document, input_type));
 
     if (auto* body = document->body())
         return body->dispatch_event(event) ? EventResult::Accepted : EventResult::Cancelled;
@@ -1577,6 +1753,10 @@ GC::Ptr<DOM::Node> EventHandler::focus_candidate_for_position(CSSPixelPoint visu
     return focus_dom_node;
 }
 
+#if defined(AK_OS_MACOS)
+static bool selection_contains_position(DOM::Document&, Painting::CaretPosition const&);
+#endif
+
 void EventHandler::run_mousedown_default_actions(DOM::Document& document, CSSPixelPoint visual_viewport_position, CSSPixelPoint viewport_position, unsigned button, unsigned modifiers, int click_count)
 {
     if (m_middle_button_scroll_handler) {
@@ -1592,7 +1772,16 @@ void EventHandler::run_mousedown_default_actions(DOM::Document& document, CSSPix
         if (!hit.has_value())
             return;
 
-        for (GC::Ptr<DOM::Node const> node = hit->paintable->dom_node(); node; node = node->parent_or_shadow_host_node()) {
+        // NB: Generated pseudo-elements don't have a DOM node, so we first have to walk up to find one.
+        GC::Ptr<DOM::Node const> start_node = nullptr;
+        for (RefPtr<Painting::Paintable> paintable = hit->paintable; paintable; paintable = paintable->parent()) {
+            if (paintable->dom_node()) {
+                start_node = paintable->dom_node();
+                break;
+            }
+        }
+
+        for (GC::Ptr<DOM::Node const> node = start_node; node; node = node->parent_or_shadow_host_node()) {
             if (node->is_editable_or_editing_host() || is<HTML::FormAssociatedTextControlElement>(*node))
                 return;
             if (auto const* anchor = as_if<HTML::HTMLAnchorElement>(*node); anchor && anchor->has_attribute(HTML::AttributeNames::href))
@@ -1612,23 +1801,7 @@ void EventHandler::run_mousedown_default_actions(DOM::Document& document, CSSPix
         return;
 #endif
 
-    // https://html.spec.whatwg.org/multipage/interaction.html#data-model:click-focusable-5
-    // When a user activates a click focusable focusable area, the user agent must run the focusing steps on that
-    // focusable area with focus trigger set to "click".
-    // NOTE: Note that focusing is not an activation behavior, i.e. calling the click() method on an element or
-    //       dispatching a synthetic click event on it won't cause the element to get focused.
-    if (auto focus_candidate = focus_candidate_for_position(viewport_position))
-        HTML::run_focusing_steps(focus_candidate, nullptr, HTML::FocusTrigger::Click);
-    else if (auto focused_area = document.focused_area())
-        HTML::run_unfocusing_steps(focused_area);
-
-    // NB: Focusing may have invalidated layout.
-    document.update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseDown);
-    if (!paint_root())
-        return;
-
-    // NB: Now we can do selection with a caret-position hit test.
-    auto caret_position = document.caret_position_from_point_for_selection_start(visual_viewport_position);
+    auto caret_position = prepare_mouse_selection(document, visual_viewport_position, viewport_position);
     if (!caret_position.has_value())
         return;
 
@@ -1638,6 +1811,13 @@ void EventHandler::run_mousedown_default_actions(DOM::Document& document, CSSPix
     auto user_select = user_select_used_value_for_caret_position(*caret_position);
     if (user_select == CSS::UserSelect::None)
         return;
+
+#if defined(AK_OS_MACOS)
+    if (click_count == 1 && !(modifiers & UIEvents::KeyModifier::Mod_Shift) && selection_contains_position(document, *caret_position)) {
+        m_mousedown_preserved_selection = true;
+        return;
+    }
+#endif
 
     auto selection_started = [&] {
         if (click_count == 3)
@@ -1654,6 +1834,159 @@ void EventHandler::run_mousedown_default_actions(DOM::Document& document, CSSPix
     if (auto container = AutoScrollHandler::find_scrollable_ancestor(*caret_position->paintable))
         m_auto_scroll_handler = make<AutoScrollHandler>(m_navigable, *container);
 }
+
+Optional<Painting::CaretPosition> EventHandler::prepare_mouse_selection(DOM::Document& document, CSSPixelPoint visual_viewport_position, CSSPixelPoint viewport_position)
+{
+    document.update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseDown);
+    if (!paint_root())
+        return {};
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#data-model:click-focusable-5
+    // When a user activates a click focusable focusable area, the user agent must run the focusing steps on that
+    // focusable area with focus trigger set to "click".
+    // NOTE: Note that focusing is not an activation behavior, i.e. calling the click() method on an element or
+    //       dispatching a synthetic click event on it won't cause the element to get focused.
+    GC::Ptr<DOM::Node> editable_hit_node_before_focus;
+    if (auto hit_before_focus = document.hit_test(visual_viewport_position, Painting::HitTestType::Exact); hit_before_focus.has_value()) {
+        if (auto* hit_node = hit_before_focus->dom_node())
+            editable_hit_node_before_focus = *hit_node;
+    }
+    auto editing_host_before_focus = editable_hit_node_before_focus ? associated_descendant_editing_host(*editable_hit_node_before_focus) : nullptr;
+
+    auto focus_candidate = editing_host_before_focus;
+    if (!focus_candidate)
+        focus_candidate = focus_candidate_for_position(viewport_position);
+    if (focus_candidate)
+        HTML::run_focusing_steps(focus_candidate, nullptr, HTML::FocusTrigger::Click);
+    else if (auto focused_area = document.focused_area())
+        HTML::run_unfocusing_steps(focused_area);
+
+    // NB: Focusing may have invalidated layout.
+    document.update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseDown);
+    if (!paint_root())
+        return {};
+
+    // NB: Now we can do selection with a caret-position hit test.
+    auto caret_position = document.caret_position_from_point_for_selection_start(visual_viewport_position);
+    if (editable_hit_node_before_focus && editing_host_before_focus && should_use_caret_position_from_editable_hit_node(caret_position, *editable_hit_node_before_focus, *editing_host_before_focus)) {
+        if (editable_hit_node_before_focus)
+            caret_position = caret_position_from_editable_hit_node(*editable_hit_node_before_focus);
+    }
+    if (!caret_position.has_value())
+        return {};
+
+    return caret_position;
+}
+
+#if defined(AK_OS_MACOS)
+bool EventHandler::select_word_for_dictionary_lookup(CSSPixelPoint visual_viewport_position)
+{
+    auto document = m_navigable->active_document();
+    if (!document)
+        return false;
+
+    document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseDown);
+    if (!paint_root())
+        return false;
+
+    auto result = target_for_mouse_position(visual_viewport_position);
+    if (!result.has_value())
+        return false;
+
+    if (auto dispatch_result = dispatch_event_to_nested_navigable(*result->paintable, visual_viewport_position, [](EventHandler& event_handler, CSSPixelPoint position) -> EventResult {
+            return event_handler.select_word_for_dictionary_lookup(position) ? EventResult::Handled : EventResult::Dropped;
+        });
+        dispatch_result.has_value()) {
+        return *dispatch_result == EventResult::Handled;
+    }
+
+    auto viewport_position = document->visual_viewport()->map_to_layout_viewport(visual_viewport_position);
+    return select_word_at_position(*document, visual_viewport_position, viewport_position);
+}
+
+static bool form_control_selection_contains_position(InputEventsTarget& target, Painting::CaretPosition const& caret_position)
+{
+    auto cell = target.as_cell();
+    if (!is<DOM::Node>(*cell))
+        return false;
+
+    auto& node = as<DOM::Node>(*cell);
+    auto const* form_control = as_if<HTML::FormAssociatedTextControlElement>(node);
+    if (!form_control)
+        return false;
+
+    auto selection_start = form_control->selection_start();
+    auto selection_end = form_control->selection_end();
+    return selection_start != selection_end
+        && caret_position.boundary.offset >= selection_start
+        && caret_position.boundary.offset <= selection_end;
+}
+
+static bool selection_contains_position(DOM::Document& document, Painting::CaretPosition const& caret_position)
+{
+    if (auto* target = document.active_input_events_target(&*caret_position.boundary.node)) {
+        if (form_control_selection_contains_position(*target, caret_position))
+            return true;
+    }
+
+    auto selection = document.get_selection();
+    if (!selection || selection->is_collapsed())
+        return false;
+
+    auto range = selection->range();
+    if (!range)
+        return false;
+
+    auto contains_position = range->is_point_in_range(*caret_position.boundary.node, caret_position.boundary.offset);
+    if (contains_position.is_error())
+        return false;
+
+    return contains_position.value();
+}
+
+bool EventHandler::select_word_at_position(DOM::Document& document, CSSPixelPoint visual_viewport_position, CSSPixelPoint viewport_position)
+{
+    auto caret_position = prepare_mouse_selection(document, visual_viewport_position, viewport_position);
+    if (!caret_position.has_value())
+        return false;
+
+    if (selection_contains_position(document, *caret_position))
+        return true;
+
+    auto user_select = user_select_used_value_for_caret_position(*caret_position);
+    if (user_select == CSS::UserSelect::None)
+        return false;
+
+    if (initiate_word_selection(document, *caret_position, user_select)) {
+        stop_updating_selection();
+        return true;
+    }
+    return false;
+}
+
+void EventHandler::start_selection_from_preserved_mousedown(DOM::Document& document)
+{
+    m_mousedown_preserved_selection = false;
+
+    if (!m_mousedown_visual_viewport_position.has_value())
+        return;
+
+    auto viewport_position = document.visual_viewport()->map_to_layout_viewport(*m_mousedown_visual_viewport_position);
+    auto caret_position = prepare_mouse_selection(document, *m_mousedown_visual_viewport_position, viewport_position);
+    if (!caret_position.has_value())
+        return;
+
+    auto user_select = user_select_used_value_for_caret_position(*caret_position);
+    if (user_select == CSS::UserSelect::None)
+        return;
+
+    if (!initiate_character_selection(document, *caret_position, user_select, false))
+        return;
+
+    if (auto container = AutoScrollHandler::find_scrollable_ancestor(*caret_position->paintable))
+        m_auto_scroll_handler = make<AutoScrollHandler>(m_navigable, *container);
+}
+#endif
 
 void EventHandler::run_activation_behavior(GC::Ref<DOM::Node> node, unsigned button, unsigned modifiers)
 {
@@ -1742,6 +2075,8 @@ void EventHandler::maybe_show_context_menu(GC::Ref<DOM::Node> node, MouseEventCo
 
             m_navigable->page().did_request_media_context_menu(media_element.unique_id(), top_level_viewport_position, "", modifiers, menu);
         } else {
+            select_context_menu_text(document, coordinates.visual_viewport_position);
+
             auto for_input_events_target = document->active_input_events_target() ? ContextMenuForInputEventsTarget::Yes : ContextMenuForInputEventsTarget::No;
             m_navigable->page().client().page_did_request_context_menu(top_level_viewport_position, for_input_events_target);
         }
@@ -1974,9 +2309,9 @@ bool EventHandler::initiate_character_selection(DOM::Document& document, Paintin
         m_mouse_selection_target = active_target;
 
         if (shift_held)
-            active_target->set_selection_focus(*hit_node, index);
+            active_target->set_selection_focus(*hit_node, index, caret_position.affinity);
         else
-            active_target->set_selection_anchor(*hit_node, index);
+            active_target->set_selection_anchor(*hit_node, index, caret_position.affinity);
     } else {
         m_mouse_selection_target = nullptr;
 
@@ -2111,6 +2446,104 @@ bool EventHandler::initiate_paragraph_selection(DOM::Document& document, Paintin
     return true;
 }
 
+bool EventHandler::select_context_menu_text(DOM::Document& document, CSSPixelPoint visual_viewport_position)
+{
+    auto caret_position = document.caret_position_from_point_for_selection_start(visual_viewport_position);
+    if (!caret_position.has_value())
+        return false;
+
+    auto is_inside_current_selection = [](DOM::Document& document, Painting::CaretPosition const& caret_position) {
+        auto selection = document.get_selection();
+        if (!selection || selection->is_collapsed())
+            return false;
+
+        auto range = selection->range();
+        if (!range)
+            return false;
+
+        auto position = range->compare_point(caret_position.boundary.node, caret_position.boundary.offset);
+        if (position.is_error())
+            return false;
+
+        return position.value() == 0;
+    };
+
+    if (is_inside_current_selection(document, *caret_position))
+        return false;
+
+    auto user_select = user_select_used_value_for_caret_position(*caret_position);
+    if (user_select == CSS::UserSelect::None)
+        return false;
+
+    auto selected_text = select_context_menu_url_token(document, *caret_position, user_select)
+        || initiate_word_selection(document, *caret_position, user_select);
+    if (selected_text)
+        stop_updating_selection();
+    return selected_text;
+}
+
+bool EventHandler::select_context_menu_url_token(DOM::Document& document, Painting::CaretPosition const& caret_position, CSS::UserSelect user_select)
+{
+    auto* hit_node = as_if<DOM::Text>(*caret_position.boundary.node);
+    if (!hit_node)
+        return false;
+
+    if (hit_node->is_password_input())
+        return false;
+
+    auto const& text = hit_node->data();
+    auto length = text.length_in_code_units();
+    auto hit_index = min(caret_position.boundary.offset, length);
+    if (length == 0)
+        return false;
+
+    auto is_url_code_unit = [](char16_t code_unit) {
+        if (code_unit > 0x7f)
+            return false;
+        if (is_ascii_space(code_unit))
+            return false;
+        return !first_is_one_of(code_unit, '"', '\'', '`', '<', '>');
+    };
+
+    auto is_url_leading_punctuation = [](char16_t code_unit) {
+        return first_is_one_of(code_unit, '"', '\'', '`', '(', '[', '{', '<');
+    };
+
+    auto is_url_trailing_punctuation = [](char16_t code_unit) {
+        return first_is_one_of(code_unit, '"', '\'', '`', '.', ',', ';', ':', '!', '?', ')', ']', '}', '>');
+    };
+
+    size_t token_start = hit_index;
+    while (token_start > 0 && is_url_code_unit(text.code_unit_at(token_start - 1)))
+        --token_start;
+
+    size_t token_end = hit_index;
+    while (token_end < length && is_url_code_unit(text.code_unit_at(token_end)))
+        ++token_end;
+
+    while (token_start < token_end && is_url_leading_punctuation(text.code_unit_at(token_start)))
+        ++token_start;
+    while (token_end > token_start && is_url_trailing_punctuation(text.code_unit_at(token_end - 1)))
+        --token_end;
+
+    if (token_start == token_end)
+        return false;
+
+    constexpr auto url_punctuation = Array<u32, 4> { '.', ':', '/', '@' };
+    if (!text.substring_view(token_start, token_end - token_start).contains_any_of(url_punctuation))
+        return false;
+
+    if (auto* target = document.active_input_events_target(hit_node)) {
+        target->set_selection_anchor(*hit_node, token_start);
+        target->set_selection_focus(*hit_node, token_end);
+    } else if (auto selection = document.get_selection()) {
+        set_user_selection(hit_node, token_start, hit_node, token_end, selection, user_select);
+        document.set_needs_repaint(Badge<EventHandler> {});
+    }
+
+    return true;
+}
+
 void EventHandler::update_mouse_selection(CSSPixelPoint visual_viewport_position)
 {
     if (m_selection_mode == SelectionMode::None)
@@ -2125,7 +2558,14 @@ void EventHandler::update_mouse_selection(CSSPixelPoint visual_viewport_position
 void EventHandler::apply_mouse_selection(CSSPixelPoint visual_viewport_position)
 {
     auto& document = *m_navigable->active_document();
-    auto caret_position = document.caret_position_from_point_for_selection(visual_viewport_position);
+
+    // Selection driven through an input events target (a text control or editing host) is constrained to that
+    // target's scope, so the selection keeps tracking the mouse after it leaves the target.
+    DOM::Node const* constraint_scope = nullptr;
+    if (m_mouse_selection_target)
+        constraint_scope = m_mouse_selection_target->mouse_selection_scope();
+
+    auto caret_position = document.caret_position_from_point_for_selection(visual_viewport_position, constraint_scope);
     if (!caret_position.has_value())
         return;
 
@@ -2208,7 +2648,13 @@ void EventHandler::apply_mouse_selection(CSSPixelPoint visual_viewport_position)
     if (m_mouse_selection_target) {
         if (anchor_offset.has_value())
             m_mouse_selection_target->set_selection_anchor(anchor_node ? *anchor_node : *focus_node, anchor_offset.value());
-        m_mouse_selection_target->set_selection_focus(*focus_node, focus_index);
+        // The hit test affinity only applies when the focus is exactly the hit position; word and paragraph selection
+        // modes override the focus with segment boundaries.
+        auto focus_affinity = m_selection_mode == SelectionMode::Character
+                && focus_node == caret_position->boundary.node && focus_index == caret_position->boundary.offset
+            ? caret_position->affinity
+            : TextAffinity::Downstream;
+        m_mouse_selection_target->set_selection_focus(*focus_node, focus_index, focus_affinity);
     } else {
         if (auto selection = document.get_selection()) {
             auto selection_anchor_node = anchor_node ? anchor_node : selection->anchor_node();
@@ -2237,6 +2683,9 @@ void EventHandler::clear_mousedown_tracking()
     m_mousedown_visual_viewport_position = {};
     m_mousedown_click_count = 0;
     m_mousedown_target_is_drag_candidate = false;
+#if defined(AK_OS_MACOS)
+    m_mousedown_preserved_selection = false;
+#endif
 }
 
 void EventHandler::stop_updating_selection()

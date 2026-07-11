@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, Ladybird contributors
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -98,7 +98,7 @@ static Vector<IndexedDatabaseDocument> indexed_database_documents_for_inspection
         if (!content_navigable)
             return TraversalDecision::Continue;
 
-        auto content_document = content_navigable->active_document();
+        auto content_document = as<HTML::LocalNavigable>(*content_navigable).active_document();
         if (!content_document)
             return TraversalDecision::Continue;
 

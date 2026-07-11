@@ -251,6 +251,16 @@ Optional<URL::URL> EnvironmentSettingsObject::encoding_parse_url(StringView url)
     return DOMURL::parse(url, base_url, encoding);
 }
 
+Optional<URL::URL> EnvironmentSettingsObject::encoding_parse_url(Utf16View url)
+{
+    auto encoding = "UTF-8"_string;
+
+    if (is<HTML::Window>(global_object()))
+        encoding = static_cast<HTML::Window const&>(global_object()).associated_document().encoding_or_default();
+
+    return DOMURL::parse(url, api_base_url(), encoding);
+}
+
 // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#encoding-parsing-and-serializing-a-url
 Optional<String> EnvironmentSettingsObject::encoding_parse_and_serialize_url(StringView url)
 {
@@ -319,7 +329,7 @@ bool is_scripting_disabled(EnvironmentSettingsObject const& settings)
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#module-type-allowed
-bool module_type_allowed(EnvironmentSettingsObject const&, StringView module_type)
+bool module_type_allowed(EnvironmentSettingsObject const&, Utf16View module_type)
 {
     // 1. If moduleType is not "javascript-or-wasm", "css", or "json", then return false.
     if (module_type != "javascript-or-wasm"sv && module_type != "css"sv && module_type != "json"sv)
@@ -332,7 +342,7 @@ bool module_type_allowed(EnvironmentSettingsObject const&, StringView module_typ
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#add-module-to-resolved-module-set
-void add_module_to_resolved_module_set(EnvironmentSettingsObject& settings_object, String const& serialized_base_url, String const& normalized_specifier, Optional<URL::URL> const& as_url)
+void add_module_to_resolved_module_set(EnvironmentSettingsObject& settings_object, String const& serialized_base_url, Utf16String const& normalized_specifier, Optional<URL::URL> const& as_url)
 {
     // 1. Let global be settingsObject's global object.
     auto& global = settings_object.global_object();

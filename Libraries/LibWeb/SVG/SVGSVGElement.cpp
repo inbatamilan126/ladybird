@@ -18,6 +18,7 @@
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/Layout/SVGSVGBox.h>
 #include <LibWeb/SVG/AttributeNames.h>
+#include <LibWeb/SVG/FragmentIdentifier.h>
 #include <LibWeb/SVG/SVGAnimatedRect.h>
 #include <LibWeb/SVG/SVGSVGElement.h>
 #include <LibWeb/SVG/SVGViewElement.h>
@@ -60,9 +61,9 @@ RefPtr<CSS::StyleValue const> SVGSVGElement::width_style_value_from_attribute() 
     auto width_attribute = attribute(SVG::AttributeNames::width);
 
     RefPtr<CSS::StyleValue const> result;
-    if (auto width_value = parse_css_value(parsing_context, width_attribute.value_or(String {}), CSS::PropertyID::Width)) {
+    if (auto width_value = parse_css_value(parsing_context, width_attribute.value_or({}), CSS::PropertyID::Width)) {
         result = width_value.release_nonnull();
-    } else if (width_attribute == "") {
+    } else if (width_attribute == ""sv) {
         // If the `width` attribute is an empty string, it defaults to 100%.
         // This matches WebKit and Blink, but not Firefox. The spec is unclear.
         // FIXME: Figure out what to do here.
@@ -82,9 +83,9 @@ RefPtr<CSS::StyleValue const> SVGSVGElement::height_style_value_from_attribute()
     auto height_attribute = attribute(SVG::AttributeNames::height);
 
     RefPtr<CSS::StyleValue const> result;
-    if (auto height_value = parse_css_value(parsing_context, height_attribute.value_or(String {}), CSS::PropertyID::Height)) {
+    if (auto height_value = parse_css_value(parsing_context, height_attribute.value_or({}), CSS::PropertyID::Height)) {
         result = height_value.release_nonnull();
-    } else if (height_attribute == "") {
+    } else if (height_attribute == ""sv) {
         // If the `height` attribute is an empty string, it defaults to 100%.
         // This matches WebKit and Blink, but not Firefox. The spec is unclear.
         // FIXME: Figure out what to do here.
@@ -95,7 +96,7 @@ RefPtr<CSS::StyleValue const> SVGSVGElement::height_style_value_from_attribute()
     return result;
 }
 
-void SVGSVGElement::attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
+void SVGSVGElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
     SVGFitToViewBox::attribute_changed(*this, name, value);
@@ -115,7 +116,7 @@ void SVGSVGElement::children_changed(ChildrenChangedMetadata const&)
     // FIXME: Add support for all types of SVG fragment identifier.
     //        See: https://svgwg.org/svg2-draft/linking.html#LinksIntoSVG
     if (auto url = document().url(); url.fragment().has_value()) {
-        if (auto referenced_element = get_element_by_id(*url.fragment())) {
+        if (auto referenced_element = get_element_by_id(decode_fragment_identifier(*url.fragment()))) {
             if (auto* view_element = as_if<SVGViewElement>(*referenced_element)) {
                 set_active_view_element(*view_element);
                 return;
@@ -134,9 +135,7 @@ void SVGSVGElement::update_fallback_view_box_for_svg_as_image()
     Optional<double> width;
     Optional<double> height;
 
-    auto resolution_context = layout_node()
-        ? CSS::Length::ResolutionContext::for_layout_node(*layout_node())
-        : CSS::Length::ResolutionContext::for_document(document());
+    auto resolution_context = CSS::Length::ResolutionContext::for_document(document());
 
     auto width_attribute = get_attribute_value(SVG::AttributeNames::width);
     auto parsing_context = CSS::Parser::ParsingParams { document(), CSS::Parser::ParsingMode::SVGPresentationAttribute };

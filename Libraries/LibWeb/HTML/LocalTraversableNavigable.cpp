@@ -78,7 +78,7 @@ BrowsingContextAndDocument create_a_new_top_level_browsing_context_and_document(
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-top-level-traversable
-GC::Ref<LocalTraversableNavigable> LocalTraversableNavigable::create_a_new_top_level_traversable(GC::Ref<Page> page, GC::Ptr<HTML::BrowsingContext> opener, String target_name)
+GC::Ref<LocalTraversableNavigable> LocalTraversableNavigable::create_a_new_top_level_traversable(GC::Ref<Page> page, GC::Ptr<HTML::BrowsingContext> opener, Utf16String target_name)
 {
     auto& vm = Bindings::main_thread_vm();
     page->ensure_compositor_host();
@@ -240,12 +240,24 @@ static void populate_nested_histories_from_ui_process(DocumentState& document_st
 {
     auto& nested_histories = document_state.nested_histories();
     if (nested_histories.size() == nested_history_descriptors.size()) {
-        // NB: The UI process keeps session history across WebContent process
-        //     swaps, but nested history ids are process-local navigable ids. When
-        //     rebuilding history for an already-loaded document, preserve the live
-        //     ids created by the new WebContent process.
-        for (size_t i = 0; i < nested_history_descriptors.size(); ++i)
-            nested_history_descriptors[i].id = nested_histories[i].id;
+        // FIXME: This is temporary glue for the current load-then-seed ordering.
+        //        A replacement WebContent process can create live child navigables
+        //        before the UI process sends its canonical session-history tree.
+        //        Now that nested history ids are canonical NavigableIds, the UI id
+        //        must win; retarget the already-created child to match it. The
+        //        longer-term model should avoid creating a distinct temporary id
+        //        for a child the UI process already knows about.
+        for (size_t i = 0; i < nested_history_descriptors.size(); ++i) {
+            auto previous_id = nested_histories[i].id;
+            auto canonical_id = nested_history_descriptors[i].id;
+            if (previous_id == canonical_id)
+                continue;
+
+            for (auto& navigable : all_local_navigables()) {
+                if (navigable->id() == previous_id)
+                    navigable->set_id_for_session_history_reconstruction(canonical_id);
+            }
+        }
     }
     nested_histories.clear();
     nested_histories.ensure_capacity(nested_history_descriptors.size());
@@ -1166,7 +1178,7 @@ void ApplyHistoryStepState::start()
                     || target_entry->document_state()->reload_pending());
             if (needs_population) {
                 if (target_entry->document_state()->reload_pending() && navigable->is_top_level_traversable())
-                    navigable->page().client().page_did_start_loading(target_entry->url(), Empty {}, false);
+                    navigable->page().client().page_did_start_loading({}, target_entry->url(), Empty {}, false);
 
                 // FIXME: 1. Let navTimingType be "back_forward" if targetEntry's document is null; otherwise "reload".
 
@@ -1361,7 +1373,7 @@ void ApplyHistoryStepState::process_continuations()
                 if (navigable->parent() == nullptr
                     && !(resolved_document->browsing_context()->is_auxiliary() && resolved_document->browsing_context()->opener_browsing_context() != nullptr)
                     && target_entry->document_state()->origin() != old_origin) {
-                    target_entry->document_state()->set_navigable_target_name(String {});
+                    target_entry->document_state()->set_navigable_target_name(Utf16String {});
                 }
             }
 
@@ -2619,7 +2631,7 @@ GC::Ptr<DOM::Node> LocalTraversableNavigable::currently_focused_area()
     while (candidate->focused_area()
         && is<NavigableContainer>(candidate->focused_area().ptr())
         && as<NavigableContainer>(*candidate->focused_area()).content_navigable()) {
-        candidate = as<NavigableContainer>(*candidate->focused_area()).content_navigable()->active_document();
+        candidate = as<LocalNavigable>(*as<NavigableContainer>(*candidate->focused_area()).content_navigable()).active_document();
     }
 
     // 4. If candidate's focused area is non-null, set candidate to candidate's focused area.

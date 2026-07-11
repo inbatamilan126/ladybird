@@ -247,7 +247,7 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsi
     document->set_about_base_url(creator_base_url);
 
     // allow declarative shadow roots: true
-    document->set_allow_declarative_shadow_roots(true);
+    document->set_allow_declarative_shadow_roots(HTML::HTMLParser::AllowDeclarativeShadowRoots::Yes);
 
     // custom element registry: A new CustomElementRegistry object.
     document->set_custom_element_registry(realm.create<CustomElementRegistry>(realm));
@@ -289,7 +289,7 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsi
     // 22. Populate with html/head/body given document.
     populate_with_html_head_body(*document);
     if (!embedder)
-        document->set_supported_color_schemes({ "light"_string, "dark"_string });
+        document->set_supported_color_schemes({ "light"_utf16_fly_string, "dark"_utf16_fly_string });
 
     // 23. Make active document.
     document->make_active();

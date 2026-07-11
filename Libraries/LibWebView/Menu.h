@@ -36,6 +36,7 @@ enum class ActionID {
     Paste,
     SelectAll,
 
+    LookUpSelectedText,
     SearchSelectedText,
 
     TakeVisibleScreenshot,
@@ -51,6 +52,7 @@ enum class ActionID {
     ToggleBookmarksBar,
     BookmarkItem,
 
+    OpenAllBookmarksInTabs,
     AddBookmark,
     AddBookmarkAllTabs,
     AddBookmarkFolder,
@@ -67,6 +69,7 @@ enum class ActionID {
 
     OpenInNewTab,
     OpenInNewWindow,
+    OpenInNewPrivateWindow,
     DownloadLinkedFile,
     DownloadLinkedFileAs,
     CopyURL,

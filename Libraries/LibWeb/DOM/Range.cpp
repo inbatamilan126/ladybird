@@ -858,8 +858,8 @@ WebIDL::ExceptionOr<void> Range::insert(GC::Ref<Node> node)
     else
         parent = reference_node->parent();
 
-    // 6. Ensure pre-insertion validity of node into parent before referenceNode.
-    TRY(parent->ensure_pre_insertion_validity(node->realm(), node, reference_node));
+    // 6. Ensure pre-insert validity given node, parent, referenceNode, and « ».
+    TRY(parent->ensure_pre_insert_validity(node->realm(), node, reference_node, Node::ChildrenToExclude::None));
 
     // 7. If range’s start node is a Text node, set referenceNode to the result of splitting it with offset range’s start offset.
     if (is<Text>(*m_start_container))
@@ -1345,7 +1345,7 @@ WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> Range::create_contextual_fragment
     }
 
     // 7. Return the result of invoking the fragment parsing algorithm steps with element, compliantString, and Fragment.
-    return element->parse_fragment(compliant_string.to_utf8_but_should_be_ported_to_utf16(), HTML::ParserScriptingMode::Fragment);
+    return Element::parse_fragment(GC::Ref { *element }, compliant_string.utf16_view(), HTML::ParserScriptingMode::Fragment);
 }
 
 }
